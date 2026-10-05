@@ -201,29 +201,36 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 10 tools by default (11 when Library handoff is enabled), and `read-only` exposes 3 tools by default (4 when Library handoff is enabled).
+CatDesk has two local tool modes: `multi-tools` exposes 15 tools by default (16 when Library handoff is enabled), and `read-only` exposes 3 tools by default (4 when Library handoff is enabled).
 
 CatDesk's local tools in `multi-tools` mode are:
 
-| Tool                  | Type  | What it does                                                               |
-| --------------------- | ----- | -------------------------------------------------------------------------- |
-| `catdesk_instruction` | Guide | Returns CatDesk usage instructions and render Binagotchy                   |
-| `read`                | Read  | Reads one or more text files from the workspace                            |
-| `search`              | Read  | Searches workspace text with `rg`, `grep`, or built-in search              |
-| `write`               | Write | Creates or overwrites a file                                               |
-| `edit`                | Write | Applies guarded replace/range edits atomically                             |
-| `create_handoff`      | Read  | Optional: prepares a workspace-specific Library handoff without changing the workspace |
-| `delete`              | Write | Deletes a file or directory                                                |
-| `run_command`         | Shell | Runs a short shell command and waits for completion                        |
-| `start_command`       | Job   | Starts a long-running shell command and immediately returns a job ID       |
-| `poll_command`        | Job   | Reads incremental output and status from a background command              |
-| `cancel_command`      | Job   | Stops a background command and its child process tree                      |
+| Tool                        | Type   | What it does                                                               |
+| --------------------------- | ------ | -------------------------------------------------------------------------- |
+| `catdesk_instruction`       | Guide  | Returns CatDesk usage instructions and renders Binagotchy                  |
+| `read`                      | Read   | Reads one or more text files from the workspace                            |
+| `search_text`               | Read   | Searches workspace text with `rg`, `grep`, or built-in search              |
+| `write`                     | Write  | Creates or overwrites a file                                               |
+| `edit`                      | Write  | Applies guarded replace/range edits atomically                             |
+| `create_handoff`            | Read   | Optional: prepares a workspace-specific Library handoff without changing the workspace |
+| `delete`                    | Write  | Previews and confirms deletion of a file or directory                      |
+| `run_command`               | Shell  | Runs a short shell command and waits for completion                        |
+| `start_command`             | Job    | Starts a long-running shell command and immediately returns a job ID       |
+| `poll_command`              | Job    | Reads incremental output and status from a background command              |
+| `cancel_command`            | Job    | Stops a background command and its child process tree                      |
+| `verify_project`            | Verify | Detects and runs configured Rust, Node, and Python project checks          |
+| `git_status_summary`        | Git    | Summarizes Git status and warns on `main`/`master`                         |
+| `git_diff_summary`          | Git    | Summarizes staged, unstaged, untracked, deleted, and renamed files         |
+| `git_create_feature_branch` | Git    | Creates and switches to a validated feature branch                         |
+| `git_commit_verified`       | Git    | Verifies, previews, and commits an explicit file set with confirmation     |
 
 Long-running commands are deliberately decoupled from the lifetime of an MCP HTTP request. Builds, compilation, dependency installation, long test suites, and development servers should use `start_command`, then `poll_command` with the returned cursor. Poll responses are bounded; if `hasMoreOutput` is true, keep polling with `nextCursor` even after the command reaches a terminal state to drain the remaining buffered output. `run_command` remains the simpler path for short commands and has a 120-second maximum timeout.
 
+`verify_project` runs only CatDesk-detected standard checks. A `PARTIAL` result means verification is incomplete, for example because a required executable is missing; it is not treated as a pass. `git_commit_verified` requires an explicit file list and a dry-run confirmation token. Its dry run stages exactly the requested files; the final commit call requires that staged preview to remain unchanged and does not restage files.
+
 If browser mode is enabled, CatDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment.
 
-`search` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Installing ripgrep is optional, but gives the best search performance and behavior.
+`search_text` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Installing ripgrep is optional, but gives the best search performance and behavior.
 
 # Context window
 

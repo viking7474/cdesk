@@ -5,6 +5,7 @@ mod command;
 mod command_jobs;
 mod devtools;
 mod handoff;
+mod git_workflow;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
 mod macos_terminal;
@@ -14,6 +15,7 @@ mod cloudflare;
 mod instances;
 mod ngrok;
 mod process_runner;
+mod verification;
 mod server;
 mod startup;
 mod state;

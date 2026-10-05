@@ -16,12 +16,14 @@ use crate::command_jobs::{
     DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS,
 };
 use crate::devtools::DevtoolsBridge;
+use crate::git_workflow;
 use crate::handoff;
 use crate::mascot;
 use crate::state::{
     AgentsPathMode, Mode, ShowDetailMode, TokenStatsLayout, ToolMode, WidgetCornerStyle,
     app_config_path, load_app_config, user_home_dir,
 };
+use crate::verification;
 use crate::workspace_tools;
 
 const SERVER_NAME: &str = "catdesk";
@@ -577,6 +579,79 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
+        "verify_project" => {
+            properties.insert(
+                "status".to_string(),
+                json!({ "type": "string", "enum": ["PASSED", "FAILED", "PARTIAL", "NOT_CONFIGURED"] }),
+            );
+            properties.insert(
+                "timeoutMs".to_string(),
+                json!({ "type": "integer", "minimum": 1 }),
+            );
+            properties.insert(
+                "skipped".to_string(),
+                json!({ "type": "array", "items": { "type": "string" } }),
+            );
+            properties.insert(
+                "commands".to_string(),
+                json!({
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ecosystem": { "type": "string" },
+                            "command": { "type": "string" },
+                            "status": { "type": "string" },
+                            "success": { "type": "boolean" },
+                            "exitCode": { "type": ["integer", "null"] },
+                            "elapsedMs": { "type": "integer", "minimum": 0 },
+                            "summary": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["ecosystem", "command", "status", "success", "exitCode", "elapsedMs", "summary"]
+                    }
+                }),
+            );
+        }
+        "git_status_summary" => {
+            properties.insert("branch".to_string(), json!({ "type": "string" }));
+            properties.insert("clean".to_string(), json!({ "type": "boolean" }));
+            properties.insert("warnOnMain".to_string(), json!({ "type": "boolean" }));
+            properties.insert("raw".to_string(), json!({ "type": "string" }));
+            properties.insert("summary".to_string(), json!({ "type": "string" }));
+        }
+        "git_diff_summary" => {
+            for field in ["staged", "unstaged", "untracked", "deleted", "renamed", "ignored"] {
+                properties.insert(
+                    field.to_string(),
+                    json!({ "type": "array", "items": { "type": "string" } }),
+                );
+            }
+            properties.insert("stat".to_string(), json!({ "type": "string" }));
+            properties.insert("summary".to_string(), json!({ "type": "string" }));
+        }
+        "git_create_feature_branch" => {
+            properties.insert("branch".to_string(), json!({ "type": "string" }));
+            properties.insert("summary".to_string(), json!({ "type": "string" }));
+            properties.insert("stdout".to_string(), json!({ "type": "string" }));
+            properties.insert("stderr".to_string(), json!({ "type": "string" }));
+            properties.insert("exitCode".to_string(), json!({ "type": ["integer", "null"] }));
+            properties.insert("timedOut".to_string(), json!({ "type": "boolean" }));
+        }
+        "git_commit_verified" => {
+            properties.insert("dryRun".to_string(), json!({ "type": "boolean" }));
+            properties.insert("verificationStatus".to_string(), json!({ "type": "string" }));
+            properties.insert("verificationSummary".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "stagedFiles".to_string(),
+                json!({ "type": "array", "items": { "type": "string" } }),
+            );
+            properties.insert(
+                "confirmationToken".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
+            properties.insert("commitPreview".to_string(), json!({ "type": "object" }));
+            properties.insert("commit".to_string(), json!({ "type": "object" }));
+        }
         "write" => {
             properties.insert("path".to_string(), json!({ "type": "string" }));
             properties.insert(
@@ -929,6 +1004,46 @@ async fn handle_tools_list_with_show_detail_mode(
                 },
                 "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": true }
             }));
+            tools.push(json!({
+                "name": "verify_project",
+                "title": "Verify project",
+                "description": "Detect configured Rust, Node, and Python verification surfaces and run their fixed standard checks. Missing executables are reported as PARTIAL instead of being treated as project failures.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "timeout": {
+                            "type": "integer",
+                            "minimum": 1_000,
+                            "maximum": verification::MAX_VERIFY_TIMEOUT_MS,
+                            "description": format!(
+                                "Per-command timeout in milliseconds. Defaults to {} ms; maximum is {} ms.",
+                                verification::DEFAULT_VERIFY_TIMEOUT_MS,
+                                verification::MAX_VERIFY_TIMEOUT_MS
+                            )
+                        }
+                    }
+                },
+                "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "git_status_summary",
+                "title": "Git status summary",
+                "description": "Summarize git status and warn when the current branch is main or master.",
+                "inputSchema": { "type": "object", "properties": {} },
+                "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+            }));
+            tools.push(json!({
+                "name": "git_diff_summary",
+                "title": "Git diff summary",
+                "description": "Summarize staged, unstaged, untracked, deleted, renamed, and optionally ignored git paths.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "include_ignored": { "type": "boolean", "description": "Include ignored files from git status --ignored" }
+                    }
+                },
+                "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
+            }));
         }
 
         tools.push(catdesk_instruction_tool_descriptor());
@@ -982,6 +1097,45 @@ async fn handle_tools_list_with_show_detail_mode(
         }));
 
         if tool_mode.write_tools_enabled() {
+            if tool_mode.run_command_enabled() {
+                tools.push(json!({
+                    "name": "git_create_feature_branch",
+                    "title": "Create feature branch",
+                    "description": "Create and switch to a new git feature branch using argv-safe git execution.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "branch": { "type": "string", "description": "New branch name" }
+                        },
+                        "required": ["branch"]
+                    },
+                    "annotations": { "readOnlyHint": false, "openWorldHint": false, "destructiveHint": false }
+                }));
+                tools.push(json!({
+                    "name": "git_commit_verified",
+                    "title": "Verified git commit",
+                    "description": "Verify the project, stage exactly the requested files, and create a commit only after a dry-run confirmation token. The CatDesk workspace must be the Git repository root. dry_run=true stages the requested files but does not create a commit; the final commit call never restages files and requires the staged preview to remain unchanged.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string", "description": "Commit message without CatDesk co-author trailer" },
+                            "files": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": { "type": "string", "minLength": 1 },
+                                "description": "Explicit workspace-relative files to stage and commit; directories are rejected"
+                            },
+                            "allow_partial_verification": { "type": "boolean", "description": "Allow PARTIAL verification only after the user explicitly accepts incomplete verification, for example when a required executable is unavailable" },
+                            "allow_failed_verification": { "type": "boolean", "description": "Override FAILED or NOT_CONFIGURED verification only after explicit user acceptance" },
+                            "allow_main": { "type": "boolean", "description": "Explicitly allow committing on main/master" },
+                            "dry_run": { "type": "boolean", "description": "Run verification, stage exactly files[], and return a short-lived confirmation token without committing" },
+                            "commit_confirmation_token": { "type": "string", "description": "Token returned by the matching dry_run=true preview" }
+                        },
+                        "required": ["message", "files"]
+                    },
+                    "annotations": { "readOnlyHint": false, "openWorldHint": true, "destructiveHint": true }
+                }));
+            }
             tools.push(json!({
                 "name": "write",
                 "title": "Write file",
@@ -1165,7 +1319,13 @@ async fn handle_tools_call_with_show_detail_mode(
         } else if mode.computer_enabled() {
             if matches!(
                 tool_name.as_str(),
-                "run_command" | "start_command" | "poll_command" | "cancel_command"
+                "run_command"
+                    | "start_command"
+                    | "poll_command"
+                    | "cancel_command"
+                    | "verify_project"
+                    | "git_status_summary"
+                    | "git_diff_summary"
             ) {
                 if tool_mode.run_command_enabled() {
                     match tool_name.as_str() {
@@ -1191,6 +1351,15 @@ async fn handle_tools_call_with_show_detail_mode(
                         }
                         "poll_command" => handle_poll_command(req, command_jobs).await,
                         "cancel_command" => handle_cancel_command(req, command_jobs).await,
+                        "verify_project" => {
+                            handle_verify_project(req, workspace_root, sandbox_enabled).await
+                        }
+                        "git_status_summary" => {
+                            handle_git_status_summary(req, workspace_root, sandbox_enabled).await
+                        }
+                        "git_diff_summary" => {
+                            handle_git_diff_summary(req, workspace_root, sandbox_enabled).await
+                        }
                         _ => unreachable!(),
                     }
                 } else if tool_mode.read_only() {
@@ -1208,6 +1377,23 @@ async fn handle_tools_call_with_show_detail_mode(
                     _ => {
                         if tool_mode.write_tools_enabled() {
                             match tool_name.as_str() {
+                                "git_create_feature_branch" if tool_mode.run_command_enabled() => {
+                                    handle_git_create_feature_branch(
+                                        req,
+                                        workspace_root,
+                                        sandbox_enabled,
+                                    )
+                                    .await
+                                }
+                                "git_commit_verified" if tool_mode.run_command_enabled() => {
+                                    handle_git_commit_verified(
+                                        req,
+                                        workspace_root,
+                                        sandbox_enabled,
+                                        set_catdesk_as_co_author,
+                                    )
+                                    .await
+                                }
                                 "write" => handle_write_file(req, workspace_root),
                                 "edit" => handle_edit_file(req, workspace_root),
                                 "delete" => handle_delete_path(req, workspace_root),
@@ -1596,6 +1782,236 @@ async fn handle_cancel_command(
             );
             let structured = command_job_structured("cancel_command", &snapshot);
             tool_success_response_with_structured(req, text, structured)
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_verify_project(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    sandbox_enabled: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let timeout_ms = match arguments.get("timeout") {
+        Some(value) => match value.as_u64() {
+            Some(value)
+                if (1_000..=verification::MAX_VERIFY_TIMEOUT_MS).contains(&value) =>
+            {
+                value
+            }
+            Some(_) => {
+                return tool_error_response(
+                    req,
+                    format!(
+                        "timeout must be between 1000 and {} ms",
+                        verification::MAX_VERIFY_TIMEOUT_MS
+                    ),
+                );
+            }
+            None => {
+                return tool_error_response(req, "Parameter timeout must be an integer".into());
+            }
+        },
+        None => verification::DEFAULT_VERIFY_TIMEOUT_MS,
+    };
+
+    match verification::verify_project_with_timeout(workspace_root, timeout_ms, sandbox_enabled).await {
+        Ok(output) => {
+            let text = output.render_text();
+            let message = text.clone();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "verify_project",
+                    "message": message,
+                    "success": output.success,
+                    "status": output.status,
+                    "commands": output.commands,
+                    "skipped": output.skipped,
+                    "timeoutMs": timeout_ms,
+                }),
+            )
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_git_status_summary(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    sandbox_enabled: bool,
+) -> JsonRpcResponse {
+    match git_workflow::status_summary(workspace_root, sandbox_enabled).await {
+        Ok(output) => {
+            let text = output.summary.clone();
+            let message = text.clone();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "git_status_summary",
+                    "message": message,
+                    "success": true,
+                    "branch": output.branch,
+                    "clean": output.clean,
+                    "warnOnMain": output.warn_on_main,
+                    "raw": output.raw,
+                    "summary": output.summary,
+                }),
+            )
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_git_diff_summary(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    sandbox_enabled: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let include_ignored = match optional_bool_argument(&arguments, "include_ignored", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    match git_workflow::diff_summary(workspace_root, include_ignored, sandbox_enabled).await {
+        Ok(output) => {
+            let text = output.summary.clone();
+            let message = text.clone();
+            tool_success_response_with_structured(
+                req,
+                text,
+                json!({
+                    "toolName": "git_diff_summary",
+                    "message": message,
+                    "success": true,
+                    "staged": output.staged,
+                    "unstaged": output.unstaged,
+                    "untracked": output.untracked,
+                    "deleted": output.deleted,
+                    "renamed": output.renamed,
+                    "ignored": output.ignored,
+                    "stat": output.stat,
+                    "summary": output.summary,
+                }),
+            )
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_git_create_feature_branch(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    sandbox_enabled: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let branch = match required_string_argument(&arguments, "branch") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    match git_workflow::create_feature_branch(workspace_root, branch, sandbox_enabled).await {
+        Ok(output) => {
+            let success = output.success;
+            let text = output.summary.clone();
+            let message = text.clone();
+            let structured = json!({
+                "toolName": "git_create_feature_branch",
+                "message": message,
+                "success": success,
+                "branch": branch.trim(),
+                "summary": output.summary,
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "exitCode": output.exit_code,
+                "timedOut": output.timed_out,
+            });
+            if success {
+                tool_success_response_with_structured(req, text, structured)
+            } else {
+                tool_error_response_with_structured(req, text, structured)
+            }
+        }
+        Err(error) => tool_error_response(req, error),
+    }
+}
+
+async fn handle_git_commit_verified(
+    req: &JsonRpcRequest,
+    workspace_root: &str,
+    sandbox_enabled: bool,
+    set_catdesk_as_co_author: bool,
+) -> JsonRpcResponse {
+    let arguments = tool_arguments(req);
+    let message = match required_string_argument(&arguments, "message") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let files = match string_array_argument(&arguments, "files") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let allow_failed_verification =
+        match optional_bool_argument(&arguments, "allow_failed_verification", false) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let allow_partial_verification =
+        match optional_bool_argument(&arguments, "allow_partial_verification", false) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+    let allow_main = match optional_bool_argument(&arguments, "allow_main", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let dry_run = match optional_bool_argument(&arguments, "dry_run", false) {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let commit_confirmation_token =
+        match optional_string_argument(&arguments, "commit_confirmation_token") {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+
+    match git_workflow::commit_verified_changes(
+        workspace_root,
+        message,
+        files,
+        allow_failed_verification,
+        allow_partial_verification,
+        allow_main,
+        dry_run,
+        commit_confirmation_token,
+        sandbox_enabled,
+        set_catdesk_as_co_author,
+    )
+    .await
+    {
+        Ok(output) => {
+            let text = output.commit.summary.clone();
+            let message_text = text.clone();
+            let success = output.success;
+            let structured = json!({
+                "toolName": "git_commit_verified",
+                "message": message_text,
+                "success": success,
+                "dryRun": output.dry_run,
+                "verificationStatus": output.verification_status,
+                "verificationSummary": output.verification_summary,
+                "stagedFiles": output.staged_files,
+                "confirmationToken": output.confirmation_token,
+                "commitPreview": output.commit_preview,
+                "commit": output.commit,
+            });
+            if success {
+                tool_success_response_with_structured(req, text, structured)
+            } else {
+                tool_error_response_with_structured(req, text, structured)
+            }
         }
         Err(error) => tool_error_response(req, error),
     }
@@ -2335,12 +2751,26 @@ Always specify the branch explicitly when using `git push`."#
                 "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files. Destructive shell commands such as rm, Remove-Item, git clean, format, shutdown, and reboot are blocked; use the dedicated delete preview/confirmation flow for filesystem deletion."
                     .to_string(),
             );
+            lines.push(
+                "Use verify_project for standard Rust, Node, and Python project checks instead of manually spelling out each verification command when its detected plan fits the project. Treat PARTIAL as incomplete verification, not a pass."
+                    .to_string(),
+            );
+            lines.push(
+                "Prefer git_status_summary and git_diff_summary over raw shell Git inspection. If the current branch is main/master, use git_create_feature_branch before committing unless the user explicitly requires main."
+                    .to_string(),
+            );
         }
         if tool_mode.write_tools_enabled() {
             lines.push(
                 "Use write with create_dirs=true to create files in new directories. Use edit for one or more guarded replace/range operations; the whole edit batch is atomic and range operations use 1-based inclusive line numbers plus exact old_text. Use plain mv commands for moves and renames. For deletion, call delete with dry_run=true first, then pass its confirmation_token in the actual delete call."
                     .to_string(),
             );
+            if tool_mode.run_command_enabled() {
+                lines.push(
+                    "For commits, use git_commit_verified with an explicit files list and only when the CatDesk workspace is the Git repository root. First call it with dry_run=true; it verifies and stages exactly those files, then returns a short-lived commit_confirmation_token bound to the repository root, HEAD, branch, staged state, message, files, verification status, and co-author setting. Re-call with the same message/files/overrides plus that token to commit; the final call does not restage files. Set allow_partial_verification or allow_failed_verification only after the user explicitly accepts the corresponding verification gap; never treat PARTIAL, FAILED, or NOT_CONFIGURED as a pass by default."
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -2636,6 +3066,11 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "start_command"
             | "poll_command"
             | "cancel_command"
+            | "verify_project"
+            | "git_status_summary"
+            | "git_diff_summary"
+            | "git_create_feature_branch"
+            | "git_commit_verified"
             | "catdesk_instruction"
             | "search_text"
             | "read"
@@ -3153,6 +3588,84 @@ fn build_command_job_widget_payload(
     Some(Value::Object(payload))
 }
 
+fn build_git_workflow_widget_payload(
+    result: &Value,
+    tool_name: &str,
+    is_error: bool,
+) -> Option<Value> {
+    let structured = result.get("structuredContent")?.as_object()?;
+    let success = structured
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(!is_error);
+    let dry_run = structured
+        .get("dryRun")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (title, state) = match tool_name {
+        "git_status_summary" => ("Git Status", if is_error { "failed" } else { "done" }),
+        "git_diff_summary" => ("Git Diff Summary", if is_error { "failed" } else { "done" }),
+        "git_create_feature_branch" => (
+            if success {
+                "Feature Branch Created"
+            } else {
+                "Feature Branch Failed"
+            },
+            if success { "done" } else { "failed" },
+        ),
+        "git_commit_verified" if dry_run && success => ("Commit Preview Ready", "done"),
+        "git_commit_verified" if success => ("Commit Created", "done"),
+        "git_commit_verified" => ("Commit Blocked", "failed"),
+        _ => return None,
+    };
+    let detail = structured
+        .get("message")
+        .or_else(|| structured.get("summary"))
+        .and_then(Value::as_str)
+        .unwrap_or(title);
+    let mut payload = base_widget_payload("tool_call", title, state, Some(tool_name));
+    payload.insert(
+        "detail".to_string(),
+        json!(truncate_for_widget(detail, MAX_COMMAND_OUTPUT_CHARS)),
+    );
+    payload.insert("changedFiles".to_string(), json!([]));
+    payload.insert("hasChanges".to_string(), json!(false));
+    Some(Value::Object(payload))
+}
+
+fn build_verify_project_widget_payload(result: &Value, is_error: bool) -> Option<Value> {
+    let structured = result.get("structuredContent")?.as_object()?;
+    let status = structured
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("FAILED");
+    let (title, state) = match status {
+        "PASSED" => ("Verification Passed", "done"),
+        "PARTIAL" => ("Verification Partial", "done"),
+        "NOT_CONFIGURED" => ("Verification Not Configured", "done"),
+        _ => ("Verification Failed", "failed"),
+    };
+    let mut payload = base_widget_payload(
+        "tool_call",
+        title,
+        if is_error { "failed" } else { state },
+        Some("verify_project"),
+    );
+    payload.insert(
+        "detail".to_string(),
+        json!(truncate_for_widget(
+            structured
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or(status),
+            MAX_COMMAND_OUTPUT_CHARS,
+        )),
+    );
+    payload.insert("changedFiles".to_string(), json!([]));
+    payload.insert("hasChanges".to_string(), json!(false));
+    Some(Value::Object(payload))
+}
+
 fn build_generic_widget_payload(
     req: &JsonRpcRequest,
     result: &Value,
@@ -3283,6 +3796,31 @@ fn build_auto_widget_payload(
                 req,
                 widget_context,
                 "Failed to build delete widget payload from structuredContent.".into(),
+            ),
+        },
+        "git_status_summary"
+        | "git_diff_summary"
+        | "git_create_feature_branch"
+        | "git_commit_verified" => match build_git_workflow_widget_payload(
+            result,
+            &tool_name,
+            is_error,
+        ) {
+            Some(payload) => payload,
+            None if is_error => build_generic_widget_payload(req, result, widget_context, is_error),
+            None => build_widget_payload_error(
+                req,
+                widget_context,
+                format!("Failed to build {tool_name} widget payload from structuredContent."),
+            ),
+        },
+        "verify_project" => match build_verify_project_widget_payload(result, is_error) {
+            Some(payload) => payload,
+            None if is_error => build_generic_widget_payload(req, result, widget_context, is_error),
+            None => build_widget_payload_error(
+                req,
+                widget_context,
+                "Failed to build verify_project widget payload from structuredContent.".into(),
             ),
         },
         "run_command" => match build_run_command_widget_payload(result, widget_context, is_error) {
@@ -3442,6 +3980,9 @@ fn is_local_destructive_tool(tool_name: &str) -> bool {
             | "start_command"
             | "poll_command"
             | "cancel_command"
+            | "verify_project"
+            | "git_create_feature_branch"
+            | "git_commit_verified"
             | "write"
             | "edit"
             | "delete"
@@ -3922,6 +4463,38 @@ fn optional_string_argument<'a>(
             .ok_or_else(|| format!("Parameter {name} must be a string")),
         None => Ok(None),
     }
+}
+
+fn string_array_argument(arguments: &Value, name: &str) -> Result<Vec<String>, String> {
+    const MAX_ITEMS: usize = 200;
+    let items = arguments
+        .get(name)
+        .ok_or_else(|| format!("Missing required parameter: {name}"))?
+        .as_array()
+        .ok_or_else(|| format!("Parameter {name} must be an array of strings"))?;
+    if items.is_empty() {
+        return Err(format!("Parameter {name} must contain at least one item"));
+    }
+    if items.len() > MAX_ITEMS {
+        return Err(format!(
+            "Parameter {name} has too many items: {} (max {MAX_ITEMS})",
+            items.len()
+        ));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let item = value
+                .as_str()
+                .ok_or_else(|| format!("Parameter {name}[{index}] must be a string"))?;
+            let item = item.trim();
+            if item.is_empty() {
+                return Err(format!("Parameter {name}[{index}] must not be empty"));
+            }
+            Ok(item.to_string())
+        })
+        .collect()
 }
 
 fn optional_string_list_argument(arguments: &Value, name: &str) -> Result<Vec<String>, String> {
@@ -4448,6 +5021,98 @@ mod tests {
     }
 
     #[test]
+    fn verify_project_widget_reflects_verification_status() {
+        for (status, expected_title, expected_state) in [
+            ("PASSED", "Verification Passed", "done"),
+            ("PARTIAL", "Verification Partial", "done"),
+            ("FAILED", "Verification Failed", "failed"),
+            ("NOT_CONFIGURED", "Verification Not Configured", "done"),
+        ] {
+            let result = json!({
+                "structuredContent": {
+                    "toolName": "verify_project",
+                    "message": format!("status: {status}"),
+                    "status": status,
+                    "success": status == "PASSED",
+                    "commands": [],
+                    "skipped": [],
+                    "timeoutMs": 120000
+                }
+            });
+            let payload = build_verify_project_widget_payload(&result, false)
+                .expect("missing verify_project widget payload");
+            assert_eq!(
+                payload.get("title").and_then(Value::as_str),
+                Some(expected_title)
+            );
+            assert_eq!(
+                payload.get("state").and_then(Value::as_str),
+                Some(expected_state)
+            );
+            assert_eq!(
+                payload.get("toolName").and_then(Value::as_str),
+                Some("verify_project")
+            );
+        }
+    }
+
+    #[test]
+    fn git_workflow_widget_titles_match_operation_outcome() {
+        let cases = [
+            ("git_status_summary", true, false, "Git Status", "done"),
+            (
+                "git_diff_summary",
+                true,
+                false,
+                "Git Diff Summary",
+                "done",
+            ),
+            (
+                "git_create_feature_branch",
+                true,
+                false,
+                "Feature Branch Created",
+                "done",
+            ),
+            (
+                "git_commit_verified",
+                true,
+                true,
+                "Commit Preview Ready",
+                "done",
+            ),
+            (
+                "git_commit_verified",
+                false,
+                false,
+                "Commit Blocked",
+                "failed",
+            ),
+        ];
+
+        for (tool_name, success, dry_run, expected_title, expected_state) in cases {
+            let result = json!({
+                "structuredContent": {
+                    "toolName": tool_name,
+                    "message": "git workflow result",
+                    "success": success,
+                    "dryRun": dry_run
+                }
+            });
+            let payload = build_git_workflow_widget_payload(&result, tool_name, !success)
+                .expect("missing git workflow widget payload");
+            assert_eq!(
+                payload.get("title").and_then(Value::as_str),
+                Some(expected_title)
+            );
+            assert_eq!(
+                payload.get("state").and_then(Value::as_str),
+                Some(expected_state)
+            );
+        }
+    }
+
+    #[test]
     fn command_job_widget_state_matrix_preserves_command_ui_contract() {
         let cases = [
             ("start_command", "running", "Command Started", "waiting"),
@@ -4587,7 +5252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_mode_blocks_all_command_job_calls_even_if_invoked_directly() {
+    async fn read_only_mode_blocks_command_and_git_workflow_calls_even_if_invoked_directly() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-command-read-only-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -4598,6 +5263,17 @@ mod tests {
             ("start_command", json!({"command": "echo blocked"})),
             ("poll_command", json!({"job_id": "blocked"})),
             ("cancel_command", json!({"job_id": "blocked"})),
+            ("verify_project", json!({})),
+            ("git_status_summary", json!({})),
+            ("git_diff_summary", json!({})),
+            (
+                "git_create_feature_branch",
+                json!({"branch": "feature/blocked"}),
+            ),
+            (
+                "git_commit_verified",
+                json!({"message": "blocked", "files": ["notes.txt"], "dry_run": true}),
+            ),
         ] {
             let req = tool_call_request(tool_name, arguments);
             let response = handle_tools_call(
@@ -4928,9 +5604,14 @@ mod tests {
                 "start_command",
                 "poll_command",
                 "cancel_command",
+                "verify_project",
+                "git_status_summary",
+                "git_diff_summary",
                 "catdesk_instruction",
                 "read",
                 "search_text",
+                "git_create_feature_branch",
+                "git_commit_verified",
                 "write",
                 "edit",
                 "create_handoff",
@@ -4989,6 +5670,11 @@ mod tests {
 
         for (tool_name, field) in [
             ("run_command", "stdout"),
+            ("verify_project", "commands"),
+            ("git_status_summary", "branch"),
+            ("git_diff_summary", "staged"),
+            ("git_create_feature_branch", "branch"),
+            ("git_commit_verified", "stagedFiles"),
             ("catdesk_instruction", "instructionText"),
             ("read", "files"),
             ("search_text", "searchResults"),
@@ -5009,6 +5695,141 @@ mod tests {
                 "missing {field} in output schema for {tool_name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn verify_project_reports_not_configured_without_running_arbitrary_input() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-verify-empty-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let response = handle_verify_project(
+            &tool_call_request(
+                "verify_project",
+                json!({ "command": "echo should-not-run" }),
+            ),
+            &workspace_root_str,
+            false,
+        )
+        .await;
+        assert_no_text_content(&response);
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        assert_eq!(
+            structured.get("status").and_then(Value::as_str),
+            Some("NOT_CONFIGURED")
+        );
+        assert_eq!(
+            structured.get("success").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            structured.get("timeoutMs").and_then(Value::as_u64),
+            Some(verification::DEFAULT_VERIFY_TIMEOUT_MS)
+        );
+        assert_eq!(
+            structured
+                .get("commands")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        let invalid_timeout = handle_verify_project(
+            &tool_call_request("verify_project", json!({ "timeout": 999 })),
+            &workspace_root_str,
+            false,
+        )
+        .await;
+        assert!(result_text(&invalid_timeout).contains("timeout must be between 1000"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn verify_project_tool_schema_bounds_timeout() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-tools-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let verify = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool.get("name").and_then(Value::as_str) == Some("verify_project"))
+            })
+            .expect("missing verify_project tool");
+        let timeout = &verify["inputSchema"]["properties"]["timeout"];
+        assert_eq!(timeout["type"], json!("integer"));
+        assert_eq!(timeout["minimum"], json!(1_000));
+        assert_eq!(timeout["maximum"], json!(verification::MAX_VERIFY_TIMEOUT_MS));
+    }
+
+    #[tokio::test]
+    async fn git_workflow_tool_schemas_require_explicit_verified_commit_flow() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-tools-list")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("missing tools");
+
+        let status = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("git_status_summary"))
+            .expect("missing git_status_summary");
+        assert_eq!(
+            status["annotations"]["readOnlyHint"],
+            json!(true),
+            "status summary should remain read-only"
+        );
+
+        let commit = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("git_commit_verified"))
+            .expect("missing git_commit_verified");
+        let input = &commit["inputSchema"];
+        assert_eq!(input["required"], json!(["message", "files"]));
+        assert_eq!(input["properties"]["files"]["minItems"], json!(1));
+        assert_eq!(
+            input["properties"]["files"]["items"]["minLength"],
+            json!(1)
+        );
+        for field in [
+            "dry_run",
+            "commit_confirmation_token",
+            "allow_partial_verification",
+            "allow_failed_verification",
+            "allow_main",
+        ] {
+            assert!(
+                input["properties"].get(field).is_some(),
+                "missing git_commit_verified input field {field}"
+            );
+        }
+        assert_eq!(
+            commit["annotations"]["destructiveHint"],
+            json!(true),
+            "verified commit must remain marked destructive"
+        );
     }
 
     #[tokio::test]

@@ -327,6 +327,37 @@ pub async fn run_command(
     }
 }
 
+pub async fn run_program(
+    program: &str,
+    args: &[String],
+    workspace_root: &Path,
+    cwd: &Path,
+    sandbox_enabled: bool,
+    timeout_ms: u64,
+) -> CommandResult {
+    let result = crate::process_runner::run_program(
+        program,
+        args,
+        workspace_root,
+        cwd,
+        sandbox_enabled,
+        timeout_ms,
+        MAX_BUFFER_BYTES,
+    )
+    .await;
+
+    CommandResult {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        success: result.success,
+        exit_code: result.exit_code,
+        elapsed_ms: result.elapsed_ms,
+        timed_out: result.timed_out,
+        stdout_truncated: result.stdout_truncated,
+        stderr_truncated: result.stderr_truncated,
+    }
+}
+
 /// Format stdout+stderr into a single string.
 pub fn format_result(r: &CommandResult) -> String {
     let mut out = String::new();

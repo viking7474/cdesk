@@ -71,7 +71,7 @@ const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// Bump only when an existing ChatGPT connector must be removed and added again.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 5;
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2222,9 +2222,14 @@ toolCallCount = 0
             "start_command",
             "poll_command",
             "cancel_command",
+            "verify_project",
+            "git_status_summary",
+            "git_diff_summary",
             "catdesk_instruction",
             "read",
             "search_text",
+            "git_create_feature_branch",
+            "git_commit_verified",
             "write",
             "edit",
             "create_handoff",
@@ -2245,7 +2250,10 @@ toolCallCount = 0
         assert!(flow.bootstrap_status_active);
         assert!(flow.bootstrap_progress.is_complete());
         assert_eq!(flow.bootstrap_progress.expected_widgets, widgets);
-        assert_eq!(flow.bootstrap_progress.loaded_widget_tool_names.len(), 11);
+        assert_eq!(
+            flow.bootstrap_progress.loaded_widget_tool_names.len(),
+            widgets.len()
+        );
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

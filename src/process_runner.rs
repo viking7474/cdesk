@@ -394,6 +394,59 @@ fn shell_command(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn posix_shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+#[cfg(target_os = "linux")]
+fn program_shell_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(posix_shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn program_command(
+    program: &str,
+    args: &[String],
+    workspace_root: &Path,
+    cwd: &Path,
+    sandbox_enabled: bool,
+) -> io::Result<PreparedShellCommand> {
+    #[cfg(target_os = "linux")]
+    if uses_linux_sandbox(sandbox_enabled) {
+        let command_line = program_shell_line(program, args);
+        let (helper, scratch_dir) =
+            crate::linux_sandbox::helper_command(&command_line, workspace_root, cwd)?;
+        return Ok(PreparedShellCommand {
+            command: Command::from(helper),
+            cleanup_dir: Some(scratch_dir),
+        });
+    }
+
+    let _ = workspace_root;
+    let _ = cwd;
+    let _ = sandbox_enabled;
+    let mut command = Command::new(program);
+    command.args(args);
+    Ok(PreparedShellCommand {
+        command,
+        cleanup_dir: None,
+    })
+}
+
 fn spawn_prepared_shell_command(
     prepared: PreparedShellCommand,
     cwd: &Path,
@@ -498,6 +551,32 @@ pub async fn spawn_shell_command(
     // PR_SET_PDEATHSIG parent is the specific thread that created the process.
     // Tokio retires idle blocking workers, so spawning bwrap there can kill an
     // otherwise healthy long-running command when that worker exits.
+    spawn_prepared_shell_command(prepared, cwd)
+}
+
+pub async fn spawn_program(
+    program: &str,
+    args: &[String],
+    workspace_root: &Path,
+    cwd: &Path,
+    sandbox_enabled: bool,
+) -> io::Result<SpawnedProcess> {
+    let program = program.to_owned();
+    let args = args.to_vec();
+    let workspace_root = workspace_root.to_path_buf();
+    let cwd_for_prepare = cwd.to_path_buf();
+    let prepared = tokio::task::spawn_blocking(move || {
+        program_command(
+            &program,
+            &args,
+            &workspace_root,
+            &cwd_for_prepare,
+            sandbox_enabled,
+        )
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("program preparation task failed: {error}")))??;
+
     spawn_prepared_shell_command(prepared, cwd)
 }
 
@@ -693,6 +772,105 @@ pub async fn run_shell_command(
     }
 }
 
+pub async fn run_program(
+    program: &str,
+    args: &[String],
+    workspace_root: &Path,
+    cwd: &Path,
+    sandbox_enabled: bool,
+    timeout_ms: u64,
+    max_capture_bytes: usize,
+) -> ProcessRunResult {
+    let started = Instant::now();
+    let mut process = match spawn_program(program, args, workspace_root, cwd, sandbox_enabled).await {
+        Ok(process) => process,
+        Err(error) => {
+            return ProcessRunResult {
+                stdout: String::new(),
+                stderr: format!("Failed to execute: {error}"),
+                success: false,
+                exit_code: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                timed_out: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            };
+        }
+    };
+
+    let stdout_task = process
+        .take_stdout()
+        .map(|stdout| tokio::spawn(capture_reader(stdout, max_capture_bytes)));
+    let stderr_task = process
+        .take_stderr()
+        .map(|stderr| tokio::spawn(capture_reader(stderr, max_capture_bytes)));
+
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let status = match timeout(Duration::from_millis(timeout_ms), process.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            wait_error = Some(error.to_string());
+            process.terminate_tree().await;
+            process.wait().await.ok()
+        }
+        Err(_) => {
+            timed_out = true;
+            process.terminate_tree().await;
+            process.wait().await.ok()
+        }
+    };
+    process.disarm().await;
+
+    let stdout_capture = finish_capture(stdout_task, "stdout").await;
+    let stderr_capture = finish_capture(stderr_task, "stderr").await;
+    let stdout = stdout_capture.text;
+    let mut stderr = stderr_capture.text;
+
+    if let Some(error) = wait_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("Failed while waiting for command: {error}"),
+        );
+    }
+    if let Some(error) = stdout_capture.read_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("CatDesk failed to read stdout: {error}"),
+        );
+    }
+    if let Some(error) = stderr_capture.read_error.as_deref() {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("CatDesk failed to read stderr: {error}"),
+        );
+    }
+    if timed_out {
+        append_stderr_diagnostic(
+            &mut stderr,
+            &format!("Command timed out after {timeout_ms} ms"),
+        );
+    }
+
+    let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
+    let success = wait_error.is_none()
+        && !timed_out
+        && status
+            .as_ref()
+            .is_some_and(std::process::ExitStatus::success);
+
+    ProcessRunResult {
+        stdout,
+        stderr,
+        success,
+        exit_code,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        timed_out,
+        stdout_truncated: stdout_capture.truncated,
+        stderr_truncated: stderr_capture.truncated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +904,42 @@ mod tests {
         let path = std::env::temp_dir().join(format!("catdesk-process-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test workspace");
         path
+    }
+
+    #[test]
+    fn direct_program_preparation_preserves_argv_without_shell_interpolation() {
+        let root = workspace("direct-program");
+        let args = vec![
+            "status; echo should-not-run".to_string(),
+            "path with spaces".to_string(),
+        ];
+        let prepared = program_command("git", &args, &root, &root, false)
+            .expect("prepare direct program");
+        let command = prepared.command.as_std();
+        assert_eq!(command.get_program(), "git");
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            args
+        );
+        assert!(prepared.cleanup_dir.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_program_shell_line_quotes_each_argument() {
+        let line = program_shell_line(
+            "git",
+            &[
+                "commit".to_string(),
+                "-m".to_string(),
+                "can't; echo nope".to_string(),
+            ],
+        );
+        assert_eq!(line, "'git' 'commit' '-m' 'can'\"'\"'t; echo nope'");
     }
 
     #[test]
