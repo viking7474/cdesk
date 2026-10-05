@@ -762,9 +762,21 @@ mod tests {
         path
     }
 
+    fn successful_job_timeout_ms() -> u64 {
+        if cfg!(windows) {
+            15_000
+        } else {
+            5_000
+        }
+    }
+
     async fn wait_terminal(manager: &CommandJobManager, job_id: &str) -> CommandJobSnapshot {
         let mut cursor = 0;
-        for _ in 0..30 {
+        // Hosted Windows runners can spend several seconds starting PowerShell
+        // and attaching its process tree to a Job Object. Keep this polling
+        // budget above the Windows success-test timeout without changing
+        // production timeout behavior.
+        for _ in 0..80 {
             let snapshot = manager.poll(job_id, cursor, 250).await.expect("poll job");
             cursor = snapshot.next_cursor;
             if snapshot.state.is_terminal() {
@@ -799,7 +811,12 @@ mod tests {
         };
         let started = Instant::now();
         let started_job = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                successful_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
         assert!(started.elapsed() < StdDuration::from_millis(250));
@@ -826,7 +843,12 @@ mod tests {
             "printf 'first\\n'; sleep 0.25; printf 'second\\n'"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                successful_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
 
@@ -968,7 +990,12 @@ mod tests {
             "(sleep 0.8; printf survived > descendant.txt) & sleep 5"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                successful_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start descendant job");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1359,7 +1386,12 @@ mod tests {
             "printf 'done\\n'"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                successful_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
         let terminal = wait_terminal(&manager, &started.snapshot.job_id).await;
@@ -1382,7 +1414,12 @@ mod tests {
             "sleep 0.5"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 5_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                successful_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
         let started_wait = Instant::now();
