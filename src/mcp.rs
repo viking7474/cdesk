@@ -4648,12 +4648,21 @@ mod tests {
             std::env::temp_dir().join(format!("catdesk-mcp-run-timeout-output-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
-        let command = if cfg!(windows) {
-            "Write-Output 'before-timeout'; Start-Sleep -Seconds 1"
+        let (command, timeout_ms) = if cfg!(windows) {
+            // PowerShell cold-start on hosted Windows CI can exceed 100 ms. Give
+            // the shell enough time to emit stdout, while still forcing the
+            // subsequent sleep to hit CatDesk's timeout path.
+            (
+                "[Console]::Out.WriteLine('before-timeout'); [Console]::Out.Flush(); Start-Sleep -Seconds 5",
+                1_500,
+            )
         } else {
-            "printf 'before-timeout\\n'; sleep 1"
+            ("printf 'before-timeout\\n'; sleep 1", 100)
         };
-        let req = tool_call_request("run_command", json!({ "command": command, "timeout": 100 }));
+        let req = tool_call_request(
+            "run_command",
+            json!({ "command": command, "timeout": timeout_ms }),
+        );
         let response = handle_tools_call(
             &req,
             &workspace_root_str,

@@ -73,6 +73,7 @@ impl ChangeSession {
         let original_workspace_root = workspace_root.to_path_buf();
         let workspace_root = workspace_root
             .canonicalize()
+            .map(crate::command::normalize_windows_verbatim_path)
             .unwrap_or_else(|_| original_workspace_root.clone());
         let scope = normalize_scope_paths(&original_workspace_root, &workspace_root, scope);
         let before = snapshot::collect_snapshot(&workspace_root, &scope.targets);
@@ -259,6 +260,26 @@ mod tests {
         let changes = session.changes();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, ".env");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolved_workspace_target_keeps_new_file_path_workspace_relative() {
+        let root = workspace("resolved-target");
+        let root_str = root.to_string_lossy().into_owned();
+        let target = crate::command::resolve_workspace_path(&root_str, Some("new.txt"))
+            .expect("resolve target");
+
+        let session = ChangeSession::begin(
+            &root,
+            ChangeScope::single(ChangeTarget::explicit(target, false)),
+        );
+        fs::write(root.join("new.txt"), "hello\n").expect("write new file");
+
+        let changes = session.changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "new.txt");
 
         let _ = fs::remove_dir_all(root);
     }
