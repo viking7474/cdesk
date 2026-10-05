@@ -10,6 +10,8 @@ mod linux_sandbox;
 mod macos_terminal;
 mod mascot;
 mod mcp;
+mod cloudflare;
+mod instances;
 mod ngrok;
 mod process_runner;
 mod server;
@@ -1768,6 +1770,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(handle) = app.ngrok_task.take() {
             handle.abort();
+        }
+        if let Some(handle) = app.cloudflare_task.take() {
+            handle.abort();
+        }
+        if let Some(child) = app.cloudflare_child.as_mut() {
+            let _ = child.start_kill();
+        }
+        if let Some(manager) = app.instance_manager.take() {
+            manager.shutdown_all().await;
         }
         if let Some(child) = app.remote_browser_child.as_mut() {
             let _ = child.start_kill();
@@ -5431,6 +5442,12 @@ async fn start_services(
         let app = state.lock().await;
         (app.mcp_path(), app.command_jobs.clone())
     };
+    let instance_manager = std::sync::Arc::new(instances::InstanceManager::new());
+    {
+        let mut app = state.lock().await;
+        app.instance_manager = Some(instance_manager.clone());
+    }
+    instance_manager.restore_saved().await;
     let router = server::router(
         state.clone(),
         devtools_bridge.clone(),
@@ -5463,6 +5480,14 @@ async fn start_services(
     // Start ngrok
     if let Err(e) = ngrok::start(state.clone()).await {
         state.lock().await.log("ERROR", format!("ngrok: {e}"));
+    }
+
+    // Start Cloudflare tunnel in parallel with ngrok when enabled.
+    let cloudflare_enabled = { state.lock().await.cloudflare_enabled };
+    if cloudflare_enabled {
+        if let Err(e) = cloudflare::start(state.clone()).await {
+            state.lock().await.log("ERROR", format!("cloudflare: {e}"));
+        }
     }
 
     devtools_bridge

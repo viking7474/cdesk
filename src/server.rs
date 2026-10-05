@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
 use crate::devtools::DevtoolsBridge;
+use crate::instances::InstanceManager;
 use crate::mcp::{self, JsonRpcRequest, WIDGET_PAYLOAD_META_KEY};
 use crate::state::{
     AgentsPathMode, FlowBootstrapWidget, FlowDirection, ServerUiEvent, SharedState, ShowDetailMode,
@@ -60,6 +61,10 @@ pub fn router(
     let agents_path_state = format!("{secret_prefix}/agents/path-state");
     let token_stats_layout = format!("{secret_prefix}/layout/token-stats");
     let show_detail_mode = format!("{secret_prefix}/layout/show-detail");
+    let control_path = format!("{secret_prefix}/control");
+    let control_instances_path = format!("{secret_prefix}/control/api/instances");
+    let control_stop_path = format!("{secret_prefix}/control/api/instances/{{id}}/stop");
+    let control_instance_path = format!("{secret_prefix}/control/api/instances/{{id}}");
 
     Router::new()
         .route(&health_path, get(health))
@@ -89,10 +94,102 @@ pub fn router(
             &show_detail_mode,
             post(post_show_detail_mode).options(options_show_detail_mode),
         )
+        .route(&control_path, get(get_control))
+        .route(
+            &control_instances_path,
+            get(get_control_instances).post(post_control_instances),
+        )
+        .route(&control_stop_path, post(post_control_instance_stop))
+        .route(&control_instance_path, delete(delete_control_instance))
         .route(&mcp_path, post(post_mcp_http))
         .route(&mcp_path, get(get_mcp))
         .route(&mcp_path, delete(delete_mcp))
         .with_state(state)
+}
+
+// ── multi-instance control UI ───────────────────────────────
+
+async fn get_control() -> axum::response::Html<&'static str> {
+    axum::response::Html(crate::instances::CONTROL_UI_HTML)
+}
+
+async fn instance_manager(s: &ServerState) -> Option<Arc<InstanceManager>> {
+    s.app.lock().await.instance_manager.clone()
+}
+
+async fn get_control_instances(State(s): State<ServerState>) -> Json<Value> {
+    let Some(manager) = instance_manager(&s).await else {
+        return Json(json!({ "instances": [], "error": "instance manager unavailable" }));
+    };
+    let instances = manager.list().await;
+    Json(json!({ "instances": instances }))
+}
+
+async fn post_control_instances(
+    State(s): State<ServerState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Json<Value> {
+    let Some(manager) = instance_manager(&s).await else {
+        return Json(json!({ "ok": false, "error": "instance manager unavailable" }));
+    };
+
+    let field = |key: &str| {
+        form.get(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let is_on = |key: &str| {
+        form.get(key)
+            .map(|value| matches!(value.trim(), "on" | "true" | "1" | "yes"))
+            .unwrap_or(false)
+    };
+
+    let port = match field("port").and_then(|value| value.parse::<u16>().ok()) {
+        Some(port) => port,
+        None => return Json(json!({ "ok": false, "error": "a valid port is required" })),
+    };
+
+    let spec = crate::instances::InstanceSpec {
+        name: field("name").unwrap_or_default(),
+        port,
+        workspace_root: field("workspace").unwrap_or_else(|| ".".to_string()),
+        enable_ngrok: is_on("ngrok"),
+        enable_cloudflare: is_on("cloudflare"),
+        cloudflare_mode: field("cloudflareMode").unwrap_or_else(|| "quick".to_string()),
+        cloudflare_domain: field("cloudflareDomain"),
+        cloudflare_token: field("cloudflareToken"),
+    };
+
+    match manager.add(spec).await {
+        Ok(info) => Json(json!({ "ok": true, "instance": info })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn post_control_instance_stop(
+    State(s): State<ServerState>,
+    Path(id): Path<u64>,
+) -> Json<Value> {
+    let Some(manager) = instance_manager(&s).await else {
+        return Json(json!({ "ok": false, "error": "instance manager unavailable" }));
+    };
+    match manager.stop(id).await {
+        Ok(()) => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
+async fn delete_control_instance(
+    State(s): State<ServerState>,
+    Path(id): Path<u64>,
+) -> Json<Value> {
+    let Some(manager) = instance_manager(&s).await else {
+        return Json(json!({ "ok": false, "error": "instance manager unavailable" }));
+    };
+    match manager.remove(id).await {
+        Ok(()) => Json(json!({ "ok": true })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
 }
 
 fn with_widget_action_cors(

@@ -350,6 +350,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub set_catdesk_as_co_author: bool,
     #[serde(default)]
+    pub cloudflare_enabled: bool,
+    #[serde(default)]
+    pub cloudflare_mode: CloudflareMode,
+    #[serde(default)]
+    pub cloudflare_domain: Option<String>,
+    #[serde(default)]
+    pub cloudflare_tunnel_token: Option<String>,
+    #[serde(default)]
     pub handoff_enabled: bool,
     #[serde(default = "default_sandbox_enabled")]
     pub sandbox_enabled: bool,
@@ -381,6 +389,10 @@ impl Default for AppConfig {
             ui_language: UiLanguage::English,
             partner_binagotchy_seed: None,
             set_catdesk_as_co_author: false,
+            cloudflare_enabled: false,
+            cloudflare_mode: CloudflareMode::Quick,
+            cloudflare_domain: None,
+            cloudflare_tunnel_token: None,
             handoff_enabled: false,
             sandbox_enabled: true,
             theme: theme::DEFAULT_THEME_ID.to_string(),
@@ -408,6 +420,16 @@ impl AppConfig {
             .partner_binagotchy_seed
             .take()
             .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        self.cloudflare_domain = self
+            .cloudflare_domain
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.cloudflare_tunnel_token = self
+            .cloudflare_tunnel_token
+            .take()
+            .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
         self.usage_by_model = self
             .usage_by_model
@@ -581,6 +603,26 @@ impl Mode {
     }
 }
 
+/// How the Cloudflare tunnel should be established.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudflareMode {
+    /// Quick tunnel: a random public trycloudflare.com URL, no account needed.
+    #[default]
+    Quick,
+    /// Named tunnel bound to the user's own domain (tunnel token or hostname).
+    Named,
+}
+
+impl CloudflareMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quick => "Quick tunnel",
+            Self::Named => "Named tunnel",
+        }
+    }
+}
+
 /// Which local toolset to expose in MCP.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -656,6 +698,12 @@ pub struct AppState {
     pub server_running: bool,
     pub ngrok_running: bool,
     pub ngrok_url: Option<String>,
+    pub cloudflare_enabled: bool,
+    pub cloudflare_mode: CloudflareMode,
+    pub cloudflare_domain: Option<String>,
+    pub cloudflare_tunnel_token: Option<String>,
+    pub cloudflare_running: bool,
+    pub cloudflare_url: Option<String>,
     pub remote_connected: bool,
     pub last_remote_activity_ms: Option<u128>,
     pub devtools_running: bool,
@@ -681,6 +729,9 @@ pub struct AppState {
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
     pub ngrok_task: Option<tokio::task::JoinHandle<()>>,
+    pub cloudflare_task: Option<tokio::task::JoinHandle<()>>,
+    pub cloudflare_child: Option<tokio::process::Child>,
+    pub instance_manager: Option<Arc<crate::instances::InstanceManager>>,
     pub remote_browser_child: Option<tokio::process::Child>,
     pub devtools_child: Option<tokio::process::Child>,
 }
@@ -973,6 +1024,14 @@ impl AppState {
         Self::from_config_path(port, workspace_root, config_path)
     }
 
+    pub fn new_with_config_path(
+        port: u16,
+        workspace_root: String,
+        config_path: PathBuf,
+    ) -> std::io::Result<Self> {
+        Self::from_config_path(port, workspace_root, config_path)
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         port: u16,
@@ -1027,6 +1086,12 @@ impl AppState {
             server_running: false,
             ngrok_running: false,
             ngrok_url: None,
+            cloudflare_enabled: config.cloudflare_enabled,
+            cloudflare_mode: config.cloudflare_mode,
+            cloudflare_domain: config.cloudflare_domain.clone(),
+            cloudflare_tunnel_token: config.cloudflare_tunnel_token.clone(),
+            cloudflare_running: false,
+            cloudflare_url: None,
             remote_connected: false,
             last_remote_activity_ms: None,
             devtools_running: false,
@@ -1052,6 +1117,9 @@ impl AppState {
             config_path,
             server_handle: None,
             ngrok_task: None,
+            cloudflare_task: None,
+            cloudflare_child: None,
+            instance_manager: None,
             remote_browser_child: None,
             devtools_child: None,
         })
@@ -1090,6 +1158,10 @@ impl AppState {
         let mut config = AppConfig::load_from_path(&self.config_path)?;
         config.mcp_slug = Some(self.mcp_slug.clone());
         config.ngrok_domain = self.ngrok_domain.clone();
+        config.cloudflare_enabled = self.cloudflare_enabled;
+        config.cloudflare_mode = self.cloudflare_mode;
+        config.cloudflare_domain = self.cloudflare_domain.clone();
+        config.cloudflare_tunnel_token = self.cloudflare_tunnel_token.clone();
         config.last_started_version = Some(env!("CARGO_PKG_VERSION").to_string());
         config.chatgpt_connector_revision = self.chatgpt_connector_revision;
         config.partner_binagotchy_seed = self.partner_binagotchy_seed.clone();
