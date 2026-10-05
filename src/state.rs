@@ -71,7 +71,7 @@ const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// Bump only when an existing ChatGPT connector must be removed and added again.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 3;
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2224,7 +2224,7 @@ toolCallCount = 0
             "cancel_command",
             "catdesk_instruction",
             "read",
-            "search",
+            "search_text",
             "write",
             "edit",
             "create_handoff",
@@ -2254,7 +2254,7 @@ toolCallCount = 0
     #[test]
     fn bootstrap_widget_reads_can_complete_out_of_order() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-out-of-order");
-        let widgets = ["read", "search", "edit"].map(bootstrap_widget).to_vec();
+        let widgets = ["read", "search_text", "edit"].map(bootstrap_widget).to_vec();
         record_successful_bootstrap_handshake(&mut app, widgets.clone());
 
         for widget in widgets.iter().rev() {
@@ -2350,14 +2350,14 @@ toolCallCount = 0
         let widget = bootstrap_widget("read");
         record_successful_bootstrap_handshake(&mut app, vec![widget]);
 
-        app.record_bootstrap_widget_read_response("stateless", "search", true);
+        app.record_bootstrap_widget_read_response("stateless", "search_text", true);
 
         let flow = app.flows.first().expect("missing flow");
         assert!(!flow.bootstrap_progress.is_complete());
         assert!(
             flow.bootstrap_progress
                 .loaded_widget_tool_names
-                .contains("search")
+                .contains("search_text")
         );
 
         let _ = std::fs::remove_file(config_path);
@@ -2367,9 +2367,9 @@ toolCallCount = 0
     #[test]
     fn repeated_tools_list_drops_loaded_tools_that_are_no_longer_expected() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-refresh-tools");
-        let widgets = ["read", "search"].map(bootstrap_widget).to_vec();
+        let widgets = ["read", "search_text"].map(bootstrap_widget).to_vec();
         record_successful_bootstrap_handshake(&mut app, widgets);
-        app.record_bootstrap_widget_read_response("stateless", "search", true);
+        app.record_bootstrap_widget_read_response("stateless", "search_text", true);
 
         app.record_bootstrap_tools_list_response("stateless", true, vec![bootstrap_widget("read")]);
 

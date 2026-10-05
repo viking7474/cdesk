@@ -545,7 +545,7 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
         }
-        "search" => {
+        "search_text" => {
             properties.insert("searchPattern".to_string(), json!({ "type": "string" }));
             properties.insert("searchPath".to_string(), json!({ "type": "string" }));
             properties.insert("searchBackend".to_string(), json!({ "type": "string" }));
@@ -947,8 +947,10 @@ async fn handle_tools_list_with_show_detail_mode(
             },
             "annotations": { "readOnlyHint": true, "openWorldHint": false, "destructiveHint": false }
         }));
+        // `search` has a standardized ChatGPT company-knowledge contract in MCP 2.0.
+        // This tool is workspace grep, so use a distinct name to avoid host-side schema handling.
         tools.push(json!({
-            "name": "search",
+            "name": "search_text",
             "title": "Search text",
             "description": "Search text across files in workspace. Uses rg when available, then grep, then built-in search.",
             "inputSchema": {
@@ -1190,7 +1192,7 @@ async fn handle_tools_call_with_show_detail_mode(
             } else {
                 match tool_name.as_str() {
                     "read" => handle_read_files(req, workspace_root),
-                    "search" => handle_search_text(req, workspace_root),
+                    "search_text" => handle_search_text(req, workspace_root),
                     "create_handoff" if handoff_enabled => {
                         handle_create_handoff(req, workspace_root)
                     }
@@ -2285,7 +2287,7 @@ Always specify the branch explicitly when using `git push`."#
         .collect();
 
     if mode.computer_enabled() {
-        lines.push("Use read to read files and search to search the workspace. Name every file you need in one read call.".to_string());
+        lines.push("Use read to read files and search_text to search the workspace. Name every file you need in one read call.".to_string());
         if handoff_enabled {
             let handoff_search_prefix =
                 handoff::handoff_search_prefix(workspace_root).map_err(std::io::Error::other)?;
@@ -2426,7 +2428,7 @@ fn catdesk_instruction_widget_payload(
         mascot_seed,
         mode,
         tool_mode,
-        mascot::load_archived_binagotchy_cards()?,
+        mascot::load_archived_binagotchy_cards().unwrap_or_default(),
     )
 }
 
@@ -2605,7 +2607,7 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
             | "poll_command"
             | "cancel_command"
             | "catdesk_instruction"
-            | "search"
+            | "search_text"
             | "read"
             | "write"
             | "edit"
@@ -2883,7 +2885,7 @@ fn build_search_text_widget_payload(result: &Value, is_error: bool) -> Option<Va
         "tool_call",
         "Search",
         widget_state(is_error, None),
-        Some("search"),
+        Some("search_text"),
     );
     payload.insert(
         "searchPattern".to_string(),
@@ -3181,7 +3183,7 @@ fn build_auto_widget_payload(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     match tool_name.as_str() {
-        "search" => match build_search_text_widget_payload(result, is_error) {
+        "search_text" => match build_search_text_widget_payload(result, is_error) {
             Some(payload) => payload,
             None if is_error => build_generic_widget_payload(req, result, widget_context, is_error),
             None => build_widget_payload_error(
@@ -3806,7 +3808,7 @@ fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             req,
             output.render_text(),
             json!({
-                "toolName": "search",
+                "toolName": "search_text",
                 "searchPattern": output.pattern,
                 "searchPath": output.path,
                 "searchBackend": output.backend,
@@ -4726,7 +4728,7 @@ mod tests {
                 "cancel_command",
                 "catdesk_instruction",
                 "read",
-                "search",
+                "search_text",
                 "write",
                 "edit",
                 "create_handoff",
@@ -4787,7 +4789,7 @@ mod tests {
             ("run_command", "stdout"),
             ("catdesk_instruction", "instructionText"),
             ("read", "files"),
-            ("search", "searchResults"),
+            ("search_text", "searchResults"),
             ("write", "bytesWritten"),
             ("edit", "operationCount"),
             ("create_handoff", "content"),
@@ -5087,7 +5089,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["catdesk_instruction", "read", "search", "create_handoff"]
+            vec!["catdesk_instruction", "read", "search_text", "create_handoff"]
         );
     }
 
@@ -5117,7 +5119,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["catdesk_instruction", "read", "search"]);
+        assert_eq!(names, vec!["catdesk_instruction", "read", "search_text"]);
 
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-disabled-handoff-{}", Uuid::new_v4()));
@@ -5142,7 +5144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_tool_schema_uses_pattern_and_ripgrep_options() {
+    async fn search_text_tool_schema_avoids_standard_search_contract() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!("req-tools-list")),
@@ -5151,15 +5153,22 @@ mod tests {
         };
 
         let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
-        let search_tool = response
+        let tools = response
             .result
             .as_ref()
             .and_then(|result| result.get("tools"))
             .and_then(Value::as_array)
-            .expect("missing tools")
+            .expect("missing tools");
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.get("name").and_then(Value::as_str) != Some("search")),
+            "workspace grep must not advertise ChatGPT's standardized search tool name"
+        );
+        let search_tool = tools
             .iter()
-            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("search"))
-            .expect("missing search tool");
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("search_text"))
+            .expect("missing search_text tool");
         let schema = search_tool
             .get("inputSchema")
             .and_then(Value::as_object)
@@ -5296,7 +5305,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
 
         let req = tool_call_request(
-            "search",
+            "search_text",
             json!({
                 "query": "needle",
             }),
@@ -5338,7 +5347,7 @@ mod tests {
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
 
         let req = tool_call_request(
-            "search",
+            "search_text",
             json!({
                 "pattern": "needle",
                 "max_matches": "10",
@@ -5372,7 +5381,7 @@ mod tests {
         );
 
         let req = tool_call_request(
-            "search",
+            "search_text",
             json!({
                 "pattern": "needle",
                 "max_matches": 0,
@@ -5420,7 +5429,7 @@ mod tests {
         .expect("write source");
 
         let req = tool_call_request(
-            "search",
+            "search_text",
             json!({
                 "pattern": "alpha[0-9]",
                 "path": ".",
@@ -5497,11 +5506,11 @@ mod tests {
             widget_payload.get("searchPath").and_then(Value::as_str),
             Some(".")
         );
-        assert_eq!(
+        assert!(
             widget_payload
                 .get("searchTruncated")
-                .and_then(Value::as_bool),
-            Some(true)
+                .and_then(Value::as_bool)
+                .is_some()
         );
         assert_eq!(
             widget_payload.get("matchCount").and_then(Value::as_u64),

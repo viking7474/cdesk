@@ -3662,7 +3662,7 @@
             return validPayload(next);
           }
 
-          if (toolName === "search") {
+          if (toolName === "search_text") {
             var searchPattern = readString(data.searchPattern);
             var searchPath = readNonEmptyString(data.searchPath);
             var searchBackend = readNonEmptyString(data.searchBackend);
@@ -7681,7 +7681,7 @@
               view.toolName === "poll_command" ||
               view.toolName === "cancel_command");
           var isSearchText =
-            view.panelMode === "tool_call" && view.toolName === "search";
+            view.panelMode === "tool_call" && view.toolName === "search_text";
           var isReadFile =
             view.panelMode === "tool_call" && view.toolName === "read";
           var isFileChange =
@@ -7977,7 +7977,7 @@
             nextView.toolName !== "start_command" &&
             nextView.toolName !== "poll_command" &&
             nextView.toolName !== "cancel_command" &&
-            nextView.toolName !== "search" &&
+            nextView.toolName !== "search_text" &&
             nextView.toolName !== "read" &&
             nextView.toolName !== "list_files" &&
             !nextView.call &&

@@ -492,7 +492,7 @@ fn flow_argument_summary(tool: &str, arguments: &serde_json::Map<String, Value>)
         "run_command" | "start_command" => ("command", false),
         "poll_command" | "cancel_command" => ("job_id", false),
         "write" | "edit" | "delete" => ("path", true),
-        "search" => ("pattern", false),
+        "search_text" => ("pattern", false),
         _ => return None,
     };
     let value = arguments.get(key)?.as_str()?;
@@ -1441,13 +1441,13 @@ mod tests {
         let search = json!({
             "method": "tools/call",
             "params": {
-                "name": "search",
+                "name": "search_text",
                 "arguments": { "pattern": "FLOW_ANIM_CELLS" }
             }
         });
         assert_eq!(
             request_flow_label(&search),
-            "tools/call:search › FLOW_ANIM_CELLS"
+            "tools/call:search_text › FLOW_ANIM_CELLS"
         );
     }
 
@@ -1796,7 +1796,7 @@ mod tests {
                 "cancel_command",
                 "catdesk_instruction",
                 "read",
-                "search",
+                "search_text",
                 "write",
                 "edit",
                 "delete",
