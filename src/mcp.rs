@@ -4035,7 +4035,17 @@ fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
         Err(error) => return tool_error_response(req, error),
     };
     match workspace_tools::read_files(workspace_root, &paths) {
-        Ok(output) => {
+        Ok(mut output) => {
+            // The structured entry already carries the requested workspace-relative
+            // path. Keep per-file errors compact and avoid echoing resolved absolute
+            // paths (especially temp paths on Windows) back into the MCP payload.
+            for file in &mut output.files {
+                if let Some(error) = file.error.as_mut() {
+                    if let Some((reason, _)) = error.split_once(": ") {
+                        *error = reason.to_string();
+                    }
+                }
+            }
             let structured = json!({
                 "toolName": "read",
                 // The batch's byte and line counts are billed to this path, so
@@ -8543,10 +8553,13 @@ mod tests {
 
     #[test]
     fn show_detail_modes_are_injectable_for_widget_enrichment() {
-        let req = tool_call_request("unknown_tool", json!({}));
+        let req = tool_call_request("run_command", json!({}));
         let raw = json!({
             "content": [{ "type": "text", "text": "hello" }],
-            "structuredContent": { "toolName": "unknown_tool" }
+            "structuredContent": {
+                "toolName": "run_command",
+                "command": "echo hello"
+            }
         });
 
         let disabled = enrich_tool_result_with_show_detail_mode(
@@ -8619,7 +8632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_command_reports_cumulative_changes_without_vcs_admin_noise() {
+    async fn background_command_tracks_changes_without_poll_widget_or_vcs_admin_noise() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-job-diff-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join(".git")).expect("create git metadata");
@@ -8688,22 +8701,22 @@ mod tests {
             }
         }
         let terminal = terminal.expect("background command did not finish");
-        let widget_payload = terminal
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        assert_eq!(
-            widget_payload.get("hasChanges").and_then(Value::as_bool),
-            Some(true)
+        assert!(
+            terminal
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "poll_command must stay on the host-native lightweight tool UI"
         );
-        let paths = widget_payload
-            .get("changedFiles")
-            .and_then(Value::as_array)
-            .expect("missing changed files")
+        let changes = command_jobs
+            .current_changes(&job_id)
+            .await
+            .expect("read job changes");
+        let paths = changes
             .iter()
-            .filter_map(|file| file.get("path").and_then(Value::as_str))
+            .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
         assert!(paths.contains(&"visible.txt"));
         assert!(paths.iter().all(|path| !path.starts_with(".git/")));
