@@ -770,6 +770,22 @@ mod tests {
         }
     }
 
+    fn cancellable_job_timeout_ms() -> u64 {
+        if cfg!(windows) {
+            20_000
+        } else {
+            10_000
+        }
+    }
+
+    fn startup_wait_budget() -> StdDuration {
+        if cfg!(windows) {
+            StdDuration::from_secs(12)
+        } else {
+            StdDuration::from_secs(5)
+        }
+    }
+
     async fn wait_terminal(manager: &CommandJobManager, job_id: &str) -> CommandJobSnapshot {
         let mut cursor = 0;
         // Hosted Windows runners can spend several seconds starting PowerShell
@@ -789,7 +805,10 @@ mod tests {
     }
 
     async fn wait_for_file(path: &std::path::Path) {
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        // Hosted Windows runners can take several seconds before PowerShell
+        // executes even the first statement. This helper only proves the test
+        // command has started; it does not change production job timeouts.
+        let deadline = Instant::now() + startup_wait_budget();
         while !path.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -852,7 +871,7 @@ mod tests {
             .await
             .expect("start job");
 
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + startup_wait_budget();
         let first = loop {
             let snapshot = manager
                 .poll(&started.snapshot.job_id, 0, 250)
@@ -872,7 +891,7 @@ mod tests {
         };
 
         let first_cursor = first.next_cursor;
-        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let deadline = Instant::now() + startup_wait_budget();
         let second = loop {
             let snapshot = manager
                 .poll(&started.snapshot.job_id, first_cursor, 250)
@@ -906,7 +925,12 @@ mod tests {
             "printf ready > ready.txt; sleep 3; printf survived > sentinel.txt"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 10_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                cancellable_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
         wait_for_file(&ready).await;
@@ -963,7 +987,12 @@ mod tests {
             "printf ready > ready.txt; for i in $(seq 1 200); do printf '%s\\n' \"$i\"; sleep 0.005; done; sleep 3"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 10_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                cancellable_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start noisy job");
         wait_for_file(&ready).await;
@@ -1066,7 +1095,12 @@ mod tests {
             "printf ready > ready.txt; sleep 3; printf survived > sentinel.txt"
         };
         let started = manager
-            .start(command.to_string(), root.clone(), 10_000, None)
+            .start(
+                command.to_string(),
+                root.clone(),
+                cancellable_job_timeout_ms(),
+                None,
+            )
             .await
             .expect("start job");
         wait_for_file(&ready).await;
