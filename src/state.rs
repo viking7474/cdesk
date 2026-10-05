@@ -62,7 +62,10 @@ impl FlowBootstrapProgress {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.discover_complete && self.tools_list_complete && self.widgets_complete()
+        // Widget resources may be satisfied from the client's cache, in which
+        // case CatDesk never observes a resources/read request. Treat widget
+        // reads as telemetry rather than a bootstrap barrier.
+        self.discover_complete && self.tools_list_complete
     }
 }
 
@@ -71,7 +74,7 @@ const APP_CONFIG_FILE_NAME: &str = "config.toml";
 pub const GPT_5_6_AND_EARLIER_USAGE_BUCKET: &str = "through-gpt-5.6";
 pub const CURRENT_USAGE_BUCKET: &str = GPT_5_6_AND_EARLIER_USAGE_BUCKET;
 /// Bump only when an existing ChatGPT connector must be removed and added again.
-pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 6;
+pub const CURRENT_CHATGPT_CONNECTOR_REVISION: u32 = 7;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1406,11 +1409,22 @@ impl AppState {
         if !success {
             return;
         }
-        self.flow_bootstrap_progress
+        let progress = self
+            .flow_bootstrap_progress
             .entry(flow_id.to_string())
-            .or_default()
-            .loaded_widget_tool_names
-            .insert(tool_name.to_string());
+            .or_default();
+        if tool_name == "*" {
+            let expected_tool_names = progress
+                .expected_widgets
+                .iter()
+                .map(|widget| widget.tool_name.clone())
+                .collect::<Vec<_>>();
+            progress.loaded_widget_tool_names.extend(expected_tool_names);
+        } else {
+            progress
+                .loaded_widget_tool_names
+                .insert(tool_name.to_string());
+        }
         self.sync_flow_bootstrap_progress(flow_id);
     }
 
@@ -2176,7 +2190,7 @@ toolCallCount = 0
 
     fn bootstrap_widget(tool_name: &str) -> FlowBootstrapWidget {
         FlowBootstrapWidget {
-            uri: format!("ui://widget/catdesk-dashboard.html?toolName={tool_name}"),
+            uri: "ui://widget/catdesk-dashboard.html?widgetRevision=7".to_string(),
             tool_name: tool_name.to_string(),
             label: if tool_name == "catdesk_instruction" {
                 "instruction".to_string()
@@ -2220,14 +2234,9 @@ toolCallCount = 0
         let widgets = [
             "run_command",
             "start_command",
-            "poll_command",
             "cancel_command",
             "verify_project",
-            "git_status_summary",
-            "git_diff_summary",
             "catdesk_instruction",
-            "read",
-            "search_text",
             "git_create_feature_branch",
             "git_commit_verified",
             "write",
@@ -2239,12 +2248,17 @@ toolCallCount = 0
         .to_vec();
         record_successful_bootstrap_handshake(&mut app, widgets.clone());
 
-        for widget in &widgets {
-            let event = format!("resources/read:{}", widget.tool_name);
-            app.record_flow("stateless", &[event.clone()], FlowDirection::Forward);
-            app.record_bootstrap_widget_read_response("stateless", &widget.tool_name, true);
-            app.record_flow("stateless", &[event], FlowDirection::Backward);
-        }
+        app.record_flow(
+            "stateless",
+            &["resources/read:base".to_string()],
+            FlowDirection::Forward,
+        );
+        app.record_bootstrap_widget_read_response("stateless", "*", true);
+        app.record_flow(
+            "stateless",
+            &["resources/read:base".to_string()],
+            FlowDirection::Backward,
+        );
 
         let flow = app.flows.first().expect("missing flow");
         assert!(flow.bootstrap_status_active);
@@ -2271,6 +2285,7 @@ toolCallCount = 0
 
         let flow = app.flows.first().expect("missing flow");
         assert!(flow.bootstrap_progress.is_complete());
+        assert!(flow.bootstrap_progress.widgets_complete());
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
@@ -2304,28 +2319,20 @@ toolCallCount = 0
     }
 
     #[test]
-    fn failed_widget_read_requires_successful_retry() {
+    fn widget_read_failure_does_not_block_cached_bootstrap_completion() {
         let (mut app, workspace, config_path) = test_app("catdesk-flow-bootstrap-read-retry");
         let widget = bootstrap_widget("read");
         record_successful_bootstrap_handshake(&mut app, vec![widget.clone()]);
 
         app.record_bootstrap_widget_read_response("stateless", &widget.tool_name, false);
-        assert!(
-            !app.flows
-                .first()
-                .expect("missing flow")
-                .bootstrap_progress
-                .is_complete()
-        );
+        let flow = app.flows.first().expect("missing flow");
+        assert!(flow.bootstrap_progress.is_complete());
+        assert!(!flow.bootstrap_progress.widgets_complete());
 
         app.record_bootstrap_widget_read_response("stateless", &widget.tool_name, true);
-        assert!(
-            app.flows
-                .first()
-                .expect("missing flow")
-                .bootstrap_progress
-                .is_complete()
-        );
+        let flow = app.flows.first().expect("missing flow");
+        assert!(flow.bootstrap_progress.is_complete());
+        assert!(flow.bootstrap_progress.widgets_complete());
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);
@@ -2342,6 +2349,7 @@ toolCallCount = 0
 
         let flow = app.flows.first().expect("missing flow");
         assert!(flow.bootstrap_progress.is_complete());
+        assert!(flow.bootstrap_progress.widgets_complete());
         assert!(
             flow.bootstrap_progress
                 .loaded_widget_tool_names
@@ -2361,7 +2369,8 @@ toolCallCount = 0
         app.record_bootstrap_widget_read_response("stateless", "search_text", true);
 
         let flow = app.flows.first().expect("missing flow");
-        assert!(!flow.bootstrap_progress.is_complete());
+        assert!(flow.bootstrap_progress.is_complete());
+        assert!(!flow.bootstrap_progress.widgets_complete());
         assert!(
             flow.bootstrap_progress
                 .loaded_widget_tool_names
@@ -2384,7 +2393,8 @@ toolCallCount = 0
         let flow = app.flows.first().expect("missing flow");
         assert_eq!(flow.bootstrap_progress.expected_widgets.len(), 1);
         assert!(flow.bootstrap_progress.loaded_widget_tool_names.is_empty());
-        assert!(!flow.bootstrap_progress.is_complete());
+        assert!(flow.bootstrap_progress.is_complete());
+        assert!(!flow.bootstrap_progress.widgets_complete());
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace);

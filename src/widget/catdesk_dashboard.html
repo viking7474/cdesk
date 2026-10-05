@@ -5589,12 +5589,19 @@
             return;
           }
           var stepIndex = 0;
+          var completedSteps = 0;
+          var maxSteps = sequence.length * 3;
 
           function applyStep() {
             var step = sequence[stepIndex];
             var frame = frames[step.frame] || frames[0] || "";
             grid.innerHTML = renderInstructionMascotFrame(current, frame);
             stepIndex = (stepIndex + 1) % sequence.length;
+            completedSteps += 1;
+            if (completedSteps >= maxSteps) {
+              instructionMascotState.timerId = 0;
+              return;
+            }
             instructionMascotState.timerId = window.setTimeout(
               applyStep,
               Math.max(1, step.repeat) * frameMs,

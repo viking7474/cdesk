@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
@@ -31,7 +31,9 @@ const SERVER_VERSION: &str = "4.0.0";
 pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
-const WIDGET_RESOURCE_REVISION: u32 = 6;
+const WIDGET_RESOURCE_REVISION: u32 = 7;
+const DISCOVERY_TTL_MS: u64 = 30_000;
+const WIDGET_RESOURCE_TTL_MS: u64 = 5 * 60 * 1000;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
@@ -273,7 +275,12 @@ pub(crate) fn decorate_modern_result(method: &str, result: &mut Value) {
             | "resources/templates/list"
             | "prompts/list"
     ) {
-        result_obj.insert("ttlMs".to_string(), json!(0));
+        let ttl_ms = if method == "resources/read" {
+            WIDGET_RESOURCE_TTL_MS
+        } else {
+            DISCOVERY_TTL_MS
+        };
+        result_obj.insert("ttlMs".to_string(), json!(ttl_ms));
         result_obj.insert("cacheScope".to_string(), json!("private"));
     }
     if result_obj.get("nextCursor").is_some_and(Value::is_null) {
@@ -343,45 +350,24 @@ fn handle_resources_list_with_show_detail_mode(
     )
 }
 
+fn widget_runtime_generation() -> u64 {
+    static GENERATION: OnceLock<u64> = OnceLock::new();
+    *GENERATION.get_or_init(rand::random::<u64>)
+}
+
 fn current_widget_resource_uri() -> String {
-    current_widget_resource_uri_for_tool("")
+    let token_stats_layout = current_token_stats_layout();
+    let widget_corner_style = current_widget_corner_style();
+    format!(
+        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&runtimeGeneration={:016x}&tokenStatsLayout={}&widgetCornerStyle={}",
+        widget_runtime_generation(),
+        token_stats_layout.as_str(),
+        widget_corner_style.as_str()
+    )
 }
 
 pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
     uri == UI_TEMPLATE_URI || uri.starts_with(&format!("{UI_TEMPLATE_URI}?"))
-}
-
-fn current_widget_resource_uri_for_tool(tool_name: &str) -> String {
-    let token_stats_layout = current_token_stats_layout();
-    let widget_corner_style = current_widget_corner_style();
-    if tool_name.is_empty() {
-        return format!(
-            "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}",
-            token_stats_layout.as_str(),
-            widget_corner_style.as_str()
-        );
-    }
-    format!(
-        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}&toolName={}",
-        token_stats_layout.as_str(),
-        widget_corner_style.as_str(),
-        tool_name
-    )
-}
-fn query_param_value<'a>(resource_uri: &'a str, key: &str) -> Option<&'a str> {
-    let query = resource_uri.split_once('?')?.1;
-    query.split('&').find_map(|part| {
-        let (param_key, param_value) = part.split_once('=')?;
-        if param_key == key {
-            Some(param_value)
-        } else {
-            None
-        }
-    })
-}
-
-fn initial_tool_name_from_resource_uri(resource_uri: &str) -> &str {
-    query_param_value(resource_uri, "toolName").unwrap_or_default()
 }
 
 fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
@@ -409,10 +395,10 @@ fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
             INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER,
             current_token_stats_layout().as_str(),
         )
-        .replace(
-            INITIAL_TOOL_NAME_PLACEHOLDER,
-            initial_tool_name_from_resource_uri(resource_uri),
-        )
+        // Tool-specific loading text comes from the tool result metadata. Keeping
+        // the template itself tool-agnostic lets every widget-bearing tool share
+        // one stable resource URI/cache entry.
+        .replace(INITIAL_TOOL_NAME_PLACEHOLDER, "")
         .replace(INITIAL_MASCOT_OUTLINE_PLACEHOLDER, &initial_mascot_outline)
 }
 
@@ -1297,7 +1283,9 @@ async fn handle_tools_call_with_show_detail_mode(
         return tool_error_response(req, "Unknown tool: create_handoff".to_string());
     }
 
-    let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
+    let should_attach_widget = show_detail_mode != ShowDetailMode::Disable
+        && tool_descriptor_should_attach_widget(&tool_name);
+    let change_session = should_attach_widget.then(|| {
         ChangeSession::begin(
             Path::new(workspace_root),
             change_scope_for_request(req, workspace_root),
@@ -1430,11 +1418,8 @@ async fn handle_tools_call_with_show_detail_mode(
         .as_ref()
         .map(ChangeSession::changes)
         .unwrap_or_default();
-    if show_detail_mode != ShowDetailMode::Disable
-        && matches!(
-            tool_name.as_str(),
-            "start_command" | "poll_command" | "cancel_command"
-        )
+    if should_attach_widget
+        && matches!(tool_name.as_str(), "start_command" | "cancel_command")
     {
         if let Some(job_id) = command_job_id_from_response(&response) {
             if let Ok(job_changes) = command_jobs.current_changes(job_id).await {
@@ -3060,20 +3045,19 @@ fn attach_tool_call_count(result: &mut Value, tool_call_count: u64) {
 }
 
 fn tool_descriptor_should_attach_widget(name: &str) -> bool {
+    // Keep high-frequency inspection/polling tools on the host-native tool UI.
+    // Every custom component is an iframe, so attaching the full CatDesk
+    // dashboard to read/search/poll/status calls compounds browser work over
+    // long conversations.
     matches!(
         name,
         "run_command"
             | "start_command"
-            | "poll_command"
             | "cancel_command"
             | "verify_project"
-            | "git_status_summary"
-            | "git_diff_summary"
             | "git_create_feature_branch"
             | "git_commit_verified"
             | "catdesk_instruction"
-            | "search_text"
-            | "read"
             | "write"
             | "edit"
             | "create_handoff"
@@ -3099,7 +3083,7 @@ fn ensure_tool_descriptor_widget_template_with_show_detail_mode(
     if !tool_descriptor_should_attach_widget(&name) {
         return;
     }
-    let resource_uri = current_widget_resource_uri_for_tool(&name);
+    let resource_uri = current_widget_resource_uri();
     let meta_value = tool_obj
         .entry("_meta".to_string())
         .or_insert_with(|| json!({}));
@@ -3855,7 +3839,9 @@ fn enrich_tool_result_with_show_detail_mode(
     widget_context: Option<&AutoWidgetContext>,
     show_detail_mode: ShowDetailMode,
 ) -> Value {
-    if show_detail_mode == ShowDetailMode::Disable {
+    if show_detail_mode == ShowDetailMode::Disable
+        || !tool_descriptor_should_attach_widget(&tool_name_from_request(req))
+    {
         return result;
     }
 
@@ -5833,7 +5819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_output_templates_include_initial_tool_name() {
+    async fn widget_tools_share_one_output_template_cache_key() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!("req-tools-list")),
@@ -5848,6 +5834,7 @@ mod tests {
             .and_then(|result| result.get("tools"))
             .and_then(Value::as_array)
             .expect("missing tools");
+        let expected = current_widget_resource_uri();
 
         for tool in tools {
             let name = tool
@@ -5862,10 +5849,75 @@ mod tests {
                 .and_then(|meta| meta.get("openai/outputTemplate"))
                 .and_then(Value::as_str)
                 .expect("missing output template");
-            assert!(
-                output_template.contains(&format!("toolName={name}")),
-                "output template should include initial tool name for {name}: {output_template}"
+            assert_eq!(
+                output_template, expected,
+                "all CatDesk widgets should share one cache key; tool={name}"
             );
+            assert!(!output_template.contains("toolName="));
+        }
+    }
+
+    #[tokio::test]
+    async fn high_frequency_tools_do_not_advertise_custom_widgets() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!("req-tools-list-lean-widgets")),
+            method: "tools/list".into(),
+            params: json!({}),
+        };
+
+        let response = handle_tools_list(&req, Mode::Both, ToolMode::MultiTools, &None).await;
+        let tools = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("tools"))
+            .and_then(Value::as_array)
+            .expect("missing tools");
+
+        for tool_name in [
+            "read",
+            "search_text",
+            "poll_command",
+            "git_status_summary",
+            "git_diff_summary",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+                .unwrap_or_else(|| panic!("missing tool {tool_name}"));
+            assert!(
+                tool.get("_meta")
+                    .and_then(|meta| meta.get("openai/outputTemplate"))
+                    .is_none(),
+                "{tool_name} should use the host's lightweight native tool UI"
+            );
+        }
+    }
+
+    #[test]
+    fn non_widget_tool_results_skip_widget_enrichment() {
+        for tool_name in [
+            "read",
+            "search_text",
+            "poll_command",
+            "git_status_summary",
+            "git_diff_summary",
+        ] {
+            let req = tool_call_request(tool_name, json!({}));
+            let raw = json!({
+                "content": [],
+                "structuredContent": {
+                    "toolName": tool_name,
+                    "success": true
+                }
+            });
+            let enriched = enrich_tool_result_with_show_detail_mode(
+                &req,
+                raw.clone(),
+                None,
+                ShowDetailMode::Expanded,
+            );
+            assert_eq!(enriched, raw, "{tool_name} must stay widget-free");
         }
     }
 
@@ -6440,7 +6492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_tool_returns_matches_in_structured_and_widget_payloads() {
+    async fn search_tool_returns_matches_without_custom_widget_payload() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-search-rg-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
@@ -6509,40 +6561,15 @@ mod tests {
             Some("src/main.rs")
         );
 
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        assert_eq!(
-            widget_payload.get("searchPattern").and_then(Value::as_str),
-            Some("alpha[0-9]")
-        );
         assert!(
-            widget_payload
-                .get("searchBackend")
-                .and_then(Value::as_str)
-                .is_some()
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "high-frequency search results should use the host-native tool UI"
         );
-        assert_eq!(
-            widget_payload.get("searchPath").and_then(Value::as_str),
-            Some(".")
-        );
-        assert!(
-            widget_payload
-                .get("searchTruncated")
-                .and_then(Value::as_bool)
-                .is_some()
-        );
-        assert_eq!(
-            widget_payload.get("matchCount").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert!(widget_payload.get("searchBackendNote").is_none());
-        assert!(widget_payload.get("searchResults").is_none());
-        assert!(widget_payload.get("searchQuery").is_none());
-        assert!(widget_payload.get("filesScanned").is_none());
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -7514,7 +7541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_tool_widget_payload_carries_per_file_failures() {
+    async fn read_tool_structured_payload_carries_per_file_failures_without_widget() {
         let workspace_root = read_workspace("widget-failures");
         std::fs::write(workspace_root.join("a.txt"), "alpha\n").expect("write file");
 
@@ -7531,21 +7558,28 @@ mod tests {
         )
         .await;
 
-        let payload = response
+        let structured = response
             .result
             .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        let failed = payload["failedFiles"]
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+        let files = structured["files"]
             .as_array()
-            .expect("missing failedFiles in widget payload");
-
-        assert_eq!(failed.len(), 1);
-        assert_eq!(payload["path"], json!("a.txt"));
-        assert_eq!(payload["renderedFileCount"], json!(1));
-        assert_eq!(failed[0]["path"], json!("missing.txt"));
-        assert_eq!(failed[0]["error"], json!("File not found"));
+            .expect("missing structured file results");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"], json!("a.txt"));
+        assert_eq!(files[0]["text"], json!("alpha\n"));
+        assert_eq!(files[1]["path"], json!("missing.txt"));
+        assert_eq!(files[1]["error"], json!("File not found"));
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "read should stay on the host-native lightweight tool UI"
+        );
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
@@ -8153,7 +8187,7 @@ mod tests {
     }
 
     #[test]
-    fn read_file_separates_model_payload_from_widget_payload() {
+    fn read_file_skips_custom_widget_enrichment() {
         let req = tool_call_request("read", json!({ "paths": ["README.md"] }));
         let raw = json!({
             "structuredContent": {
@@ -8176,88 +8210,22 @@ mod tests {
             },
             "content": [{
                 "type": "text",
-                "text": "path: README.md
-bytes: 11
-
-hello world"
+                "text": "path: README.md\nbytes: 11\n\nhello world"
             }]
         });
 
-        let result = enrich_tool_result(&req, raw, None);
-        let content = result
-            .get("content")
-            .and_then(Value::as_array)
-            .expect("missing content array");
-        assert!(content.is_empty());
-        let structured = result
-            .get("structuredContent")
-            .expect("missing structuredContent");
-        let widget_payload = result
-            .get("_meta")
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-
-        assert_eq!(
-            structured.get("toolName").and_then(Value::as_str),
-            Some("read")
+        let result = enrich_tool_result(&req, raw.clone(), None);
+        assert_eq!(result, raw);
+        assert!(
+            result
+                .get("_meta")
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none()
         );
-        assert_eq!(
-            structured.get("path").and_then(Value::as_str),
-            Some("README.md")
-        );
-        assert_eq!(structured.get("bytes").and_then(Value::as_u64), Some(11));
-        assert_eq!(
-            structured.get("sizeBytes").and_then(Value::as_u64),
-            Some(99)
-        );
-        assert_eq!(structured.get("lineCount").and_then(Value::as_u64), Some(1));
-        assert_eq!(structured["files"][0]["text"], json!("hello world"));
-        assert_eq!(
-            structured.get("batchTruncated").and_then(Value::as_bool),
-            Some(false)
-        );
-        assert!(structured.get("schema").is_none());
-        assert!(structured.get("panelMode").is_none());
-        assert!(structured.get("title").is_none());
-        assert!(structured.get("state").is_none());
-        assert!(structured.get("changedFiles").is_none());
-        assert!(structured.get("hasChanges").is_none());
-        assert_eq!(
-            widget_payload.get("title").and_then(Value::as_str),
-            Some("Read Files")
-        );
-        assert_eq!(
-            widget_payload.get("panelMode").and_then(Value::as_str),
-            Some("tool_call")
-        );
-        assert_eq!(
-            widget_payload.get("path").and_then(Value::as_str),
-            Some("README.md")
-        );
-        assert_eq!(
-            widget_payload.get("bytes").and_then(Value::as_u64),
-            Some(11)
-        );
-        assert_eq!(
-            widget_payload.get("lineCount").and_then(Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            widget_payload
-                .get("renderedFileCount")
-                .and_then(Value::as_u64),
-            Some(1)
-        );
-        // The widget payload must not reuse a structured key with a different
-        // meaning; renaming these two was how that stopped happening.
-        assert!(widget_payload.get("sizeBytes").is_none());
-        assert!(widget_payload.get("fileCount").is_none());
-        assert!(widget_payload.get("text").is_none());
-        assert!(widget_payload.get("files").is_none());
     }
 
     #[test]
-    fn read_file_missing_path_emits_widget_payload_error_panel() {
+    fn malformed_read_result_does_not_create_widget_error_panel() {
         let req = tool_call_request(
             "read",
             json!({
@@ -8279,44 +8247,24 @@ hello world"
             }]
         });
 
-        let result = enrich_tool_result(&req, raw, None);
-        let content = result
-            .get("content")
-            .and_then(Value::as_array)
-            .expect("missing content array");
-        assert!(content.is_empty());
-        let widget_payload = result
-            .get("_meta")
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-
-        assert_eq!(
-            widget_payload.get("payloadKind").and_then(Value::as_str),
-            Some("widget_payload_error")
-        );
-        assert_eq!(
-            widget_payload.get("title").and_then(Value::as_str),
-            Some("Widget Payload Error")
-        );
-        assert_eq!(
-            widget_payload.get("state").and_then(Value::as_str),
-            Some("failed")
-        );
-        assert_eq!(
-            widget_payload.get("call").and_then(Value::as_str),
-            Some("call read")
-        );
-        assert_eq!(
-            widget_payload.get("detail").and_then(Value::as_str),
-            Some("Failed to build read widget payload from structuredContent.")
+        let result = enrich_tool_result(&req, raw.clone(), None);
+        assert_eq!(result, raw);
+        assert!(
+            result
+                .get("_meta")
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none()
         );
     }
 
     #[test]
-    fn widget_resource_uri_includes_revision_for_cache_busting() {
-        let uri = current_widget_resource_uri_for_tool("catdesk_instruction");
-        assert!(uri.contains("widgetRevision=6"));
-        assert!(uri.contains("toolName=catdesk_instruction"));
+    fn widget_resource_uri_is_shared_and_revisioned_for_cache_busting() {
+        let uri = current_widget_resource_uri();
+        assert!(uri.contains("widgetRevision=7"));
+        assert!(uri.contains("runtimeGeneration="));
+        assert!(uri.contains("tokenStatsLayout="));
+        assert!(uri.contains("widgetCornerStyle="));
+        assert!(!uri.contains("toolName="));
     }
 
     #[test]

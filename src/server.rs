@@ -1537,15 +1537,15 @@ mod tests {
             "result": {
                 "tools": [
                     {
-                        "name": "read",
+                        "name": "write",
                         "_meta": {
-                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2&toolName=read"
+                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2"
                         }
                     },
                     {
                         "name": "catdesk_instruction",
                         "_meta": {
-                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2&toolName=catdesk_instruction"
+                            "openai/outputTemplate": "ui://widget/catdesk-dashboard.html?widgetRevision=2"
                         }
                     },
                     {
@@ -1561,10 +1561,11 @@ mod tests {
 
         let widgets = bootstrap_widgets_from_tools_list_response(&response);
         assert_eq!(widgets.len(), 2);
-        assert_eq!(widgets[0].tool_name, "read");
-        assert_eq!(widgets[0].label, "read");
+        assert_eq!(widgets[0].tool_name, "write");
+        assert_eq!(widgets[0].label, "write");
         assert_eq!(widgets[1].tool_name, "catdesk_instruction");
         assert_eq!(widgets[1].label, "instruction");
+        assert_eq!(widgets[0].uri, widgets[1].uri);
     }
 
     #[test]
@@ -1786,14 +1787,9 @@ mod tests {
         let expected_tool_names = vec![
             "run_command",
             "start_command",
-            "poll_command",
             "cancel_command",
             "verify_project",
-            "git_status_summary",
-            "git_diff_summary",
             "catdesk_instruction",
-            "read",
-            "search_text",
             "git_create_feature_branch",
             "git_commit_verified",
             "write",
@@ -1808,12 +1804,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_tool_names
         );
-        assert!(widgets.iter().all(|widget| {
-            widget.uri.contains("ui://widget/catdesk-dashboard.html")
-                && widget
-                    .uri
-                    .contains(&format!("toolName={}", widget.tool_name))
-        }));
+        let shared_uri = widgets
+            .first()
+            .map(|widget| widget.uri.as_str())
+            .expect("missing shared widget URI");
+        assert!(shared_uri.contains("ui://widget/catdesk-dashboard.html"));
+        assert!(!shared_uri.contains("toolName="));
+        assert!(widgets.iter().all(|widget| widget.uri == shared_uri));
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -1821,7 +1818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_mcp_tracks_widget_read_by_tool_name_across_uri_variations() {
+    async fn post_mcp_tracks_shared_widget_read_without_tool_specific_cache_key() {
         let workspace_root = unique_temp_path("catdesk-bootstrap-read-workspace");
         let config_root = unique_temp_path("catdesk-bootstrap-read-config");
         let config_path = config_root.join("config.toml");
@@ -1849,7 +1846,7 @@ mod tests {
             mcp_request_body(
                 "resources/read",
                 json!({
-                    "uri": "ui://widget/catdesk-dashboard.html?widgetRevision=999&tokenStatsLayout=bottom&toolName=read"
+                    "uri": "ui://widget/catdesk-dashboard.html?widgetRevision=999&tokenStatsLayout=bottom"
                 }),
             ),
         )
@@ -1867,7 +1864,7 @@ mod tests {
         }
         let (tool_name, success) = tracked.expect("missing bootstrap resources/read event");
         assert!(success);
-        assert_eq!(tool_name, "read");
+        assert_eq!(tool_name, "*");
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -2013,7 +2010,7 @@ mod tests {
         );
         assert_eq!(
             discover_result.get("ttlMs").and_then(Value::as_u64),
-            Some(0)
+            Some(30_000)
         );
         assert_eq!(
             discover_result.get("cacheScope").and_then(Value::as_str),
@@ -2044,7 +2041,10 @@ mod tests {
             tools_result.get("resultType").and_then(Value::as_str),
             Some("complete")
         );
-        assert_eq!(tools_result.get("ttlMs").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            tools_result.get("ttlMs").and_then(Value::as_u64),
+            Some(30_000)
+        );
         assert_eq!(
             tools_result.get("cacheScope").and_then(Value::as_str),
             Some("private")
@@ -2052,7 +2052,10 @@ mod tests {
 
         let mut read_result = json!({ "contents": [] });
         mcp::decorate_modern_result("resources/read", &mut read_result);
-        assert_eq!(read_result.get("ttlMs").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            read_result.get("ttlMs").and_then(Value::as_u64),
+            Some(5 * 60 * 1000)
+        );
         assert_eq!(
             read_result.get("cacheScope").and_then(Value::as_str),
             Some("private")
@@ -2061,6 +2064,10 @@ mod tests {
         let mut resource_list_result = json!({ "resources": [], "nextCursor": null });
         mcp::decorate_modern_result("resources/list", &mut resource_list_result);
         assert!(resource_list_result.get("nextCursor").is_none());
+        assert_eq!(
+            resource_list_result.get("ttlMs").and_then(Value::as_u64),
+            Some(30_000)
+        );
 
         let unknown = post_mcp_http(
             State(server_state.clone()),
@@ -3185,11 +3192,12 @@ async fn post_mcp_inner(
                     });
             }
             "resources/read" => {
-                if let Some(tool_name) = request_resource_uri(&body)
+                if let Some(uri) = request_resource_uri(&body)
                     .filter(|uri| mcp::is_catdesk_widget_resource_uri(uri))
-                    .and_then(|uri| query_param_value(uri, "toolName"))
-                    .filter(|tool_name| !tool_name.is_empty())
                 {
+                    let tool_name = query_param_value(uri, "toolName")
+                        .filter(|tool_name| !tool_name.is_empty())
+                        .unwrap_or("*");
                     let _ = s
                         .ui_events
                         .send(ServerUiEvent::RecordBootstrapWidgetReadResponse {

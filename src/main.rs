@@ -1156,19 +1156,18 @@ fn flow_phase_views(
                             Some(flow),
                             &event,
                             widget.label.clone(),
-                            flow.bootstrap_progress
-                                .loaded_widget_tool_names
-                                .contains(&widget.tool_name),
+                            flow.bootstrap_progress.is_complete()
+                                || flow
+                                    .bootstrap_progress
+                                    .loaded_widget_tool_names
+                                    .contains(&widget.tool_name),
                             now_millis,
                         )
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let complete = flow.is_some_and(|flow| {
-            flow.bootstrap_progress.tools_list_complete
-                && flow.bootstrap_progress.widgets_complete()
-        });
+        let complete = flow.is_some_and(|flow| flow.bootstrap_progress.is_complete());
         phases.push(FlowPhaseView {
             title: ui_language.text("Loading widgets", "載入 Widget"),
             complete,
