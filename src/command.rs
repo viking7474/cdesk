@@ -78,21 +78,7 @@ pub fn resolve_workspace_path(
         .map(normalize_windows_verbatim_path)
         .map_err(|e| e.to_string())?;
     let input = input.unwrap_or(".");
-
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        root.join(input)
-    };
-
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
-        return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    resolve_input_inside_root(&root, &root, input)
 }
 
 /// Resolve `input` relative to `cwd`, rejecting path traversal outside the workspace root.
@@ -106,18 +92,84 @@ pub fn resolve_command_path(
         .map(normalize_windows_verbatim_path)
         .map_err(|e| e.to_string())?;
     let input = input.unwrap_or(".");
+    let cwd = cwd
+        .canonicalize()
+        .map(normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    if !cwd.starts_with(&root) {
+        return Err(format!("Path escapes workspace root: {}", cwd.display()));
+    }
+    resolve_input_inside_root(&root, &cwd, input)
+}
 
-    let candidate = if Path::new(input).is_absolute() {
-        PathBuf::from(input)
-    } else {
-        cwd.join(input)
-    };
+fn resolve_input_inside_root(root: &Path, base: &Path, input: &str) -> Result<PathBuf, String> {
+    let input_path = Path::new(input);
+    if input_path.is_absolute() {
+        if input_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "Absolute path contains parent traversal: {}",
+                input_path.display()
+            ));
+        }
+        return resolve_candidate_inside_root(root, input_path.to_path_buf());
+    }
 
-    let candidate = normalize_windows_verbatim_path(candidate.canonicalize().unwrap_or(candidate));
-    if !candidate.starts_with(&root) {
+    let mut candidate = base.to_path_buf();
+    for component in input_path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !candidate.pop() || !candidate.starts_with(root) {
+                    return Err(format!("Path escapes workspace root: {input}"));
+                }
+            }
+            std::path::Component::Normal(value) => candidate.push(value),
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!("Unsupported relative path: {input}"));
+            }
+        }
+    }
+
+    resolve_candidate_inside_root(root, candidate)
+}
+
+fn resolve_candidate_inside_root(root: &Path, candidate: PathBuf) -> Result<PathBuf, String> {
+    let candidate = normalize_windows_verbatim_path(candidate);
+    if let Ok(canonical) = candidate.canonicalize() {
+        let canonical = normalize_windows_verbatim_path(canonical);
+        if !canonical.starts_with(root) {
+            return Err(format!(
+                "Path escapes workspace root: {}",
+                canonical.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("Path has no existing parent: {}", candidate.display()))?;
+    }
+    let existing_canonical = normalize_windows_verbatim_path(
+        existing
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize existing parent: {e}"))?,
+    );
+    if !existing_canonical.starts_with(root) {
         return Err(format!(
-            "Path escapes workspace root: {}",
-            candidate.display()
+            "Path escapes workspace root through existing parent: {}",
+            existing_canonical.display()
+        ));
+    }
+    if existing != candidate && !existing_canonical.is_dir() {
+        return Err(format!(
+            "Path parent is not a directory: {}",
+            existing_canonical.display()
         ));
     }
     Ok(candidate)
@@ -169,6 +221,76 @@ pub fn detect_list_files_intercept(command: &str) -> Option<InterceptedListFiles
 pub fn detect_move_path_intercept(command: &str) -> Option<InterceptedMovePathRequest> {
     let words = parse_word_only_shell_command(command)?;
     detect_move_path_intercept_from_words(&words)
+}
+
+pub fn validate_shell_safety(command: &str) -> Result<(), String> {
+    for segment in shell_segments(command) {
+        validate_shell_segment_safety(&segment)?;
+    }
+    Ok(())
+}
+
+fn validate_shell_segment_safety(segment: &str) -> Result<(), String> {
+    let words = shell_words(segment);
+    let Some(command_idx) = command_start_index(&words, |_| true) else {
+        return Ok(());
+    };
+    let command = command_basename(&words[command_idx].lower);
+
+    if is_shell_command(&command) {
+        if let Some(payload) = nested_shell_command(segment) {
+            return validate_shell_safety(&payload.command);
+        }
+    }
+
+    if matches!(
+        command.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    ) {
+        if let Some(nested_idx) = words.iter().position(|word| {
+            matches!(
+                word.lower.as_str(),
+                "-command" | "-c" | "/command" | "/c" | "-encodedcommand" | "/encodedcommand"
+            )
+        }) {
+            if matches!(
+                words[nested_idx].lower.as_str(),
+                "-encodedcommand" | "/encodedcommand"
+            ) {
+                return Err(
+                    "Blocked dangerous shell command: encoded PowerShell commands are not allowed"
+                        .into(),
+                );
+            }
+            if let Some(payload) = words.get(nested_idx + 1) {
+                return validate_shell_safety(&payload.text);
+            }
+        }
+    }
+
+    match command.as_str() {
+        "rm" | "del" | "erase" | "rd" | "rmdir" | "remove-item" | "ri" | "format"
+        | "format.com" | "shutdown" | "reboot" | "restart-computer" | "stop-computer" => {
+            Err(format!(
+                "Blocked dangerous shell command: {command}. Use the dedicated CatDesk delete tool for filesystem deletion."
+            ))
+        }
+        "git"
+            if words
+                .get(command_idx + 1)
+                .is_some_and(|word| word.lower == "clean") =>
+        {
+            Err("Blocked dangerous shell command: git clean".into())
+        }
+        "reg"
+            if words
+                .get(command_idx + 1)
+                .is_some_and(|word| word.lower == "delete") =>
+        {
+            Err("Blocked dangerous shell command: reg delete".into())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Execute a short shell command via CatDesk's shared process runner.
@@ -986,6 +1108,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[test]
+    fn resolve_workspace_path_rejects_missing_path_with_parent_traversal() {
+        let parent = test_workspace("resolve-parent-traversal-parent");
+        let workspace_root = parent.join("workspace");
+        let outside_root = parent.join("outside");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_root).expect("create outside root");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = resolve_workspace_path(&workspace_root_str, Some("../outside/new.txt"))
+            .expect_err("missing path with parent traversal must be rejected");
+        assert!(error.contains("Path escapes workspace root"));
+        let nested_error = resolve_workspace_path(
+            &workspace_root_str,
+            Some("missing/../../outside/new.txt"),
+        )
+        .expect_err("missing intermediate directories must not hide parent traversal");
+        assert!(nested_error.contains("Path escapes workspace root"));
+
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn resolve_command_path_allows_parent_navigation_that_stays_in_workspace() {
+        let workspace_root = test_workspace("resolve-command-parent");
+        let cwd = workspace_root.join("src");
+        std::fs::create_dir_all(&cwd).expect("create nested cwd");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+        let expected = normalize_windows_verbatim_path(
+            workspace_root
+                .canonicalize()
+                .expect("canonicalize workspace"),
+        )
+        .join("notes.txt");
+
+        assert_eq!(
+            resolve_command_path(&workspace_root_str, &cwd, Some("../notes.txt"))
+                .expect("resolve parent navigation inside workspace"),
+            expected
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_path_rejects_missing_path_through_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let workspace_root = test_workspace("resolve-symlink-parent");
+        let outside_root = test_workspace("resolve-symlink-outside");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        std::fs::create_dir_all(&outside_root).expect("create outside root");
+        symlink(&outside_root, workspace_root.join("escape")).expect("create symlink");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let error = resolve_workspace_path(&workspace_root_str, Some("escape/new.txt"))
+            .expect_err("missing child through symlink must be rejected");
+        assert!(error.contains("Path escapes workspace root"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(outside_root);
+    }
+
     #[tokio::test]
     async fn run_command_uses_platform_shell_and_cwd() {
         let workspace_root = test_workspace("run-cwd");
@@ -1053,6 +1239,17 @@ mod tests {
             "bash -lc 'git commit -m \"x\"'"
         ));
         assert!(!command_contains_git_commit("echo git commit"));
+    }
+
+    #[test]
+    fn validate_shell_safety_blocks_destructive_commands() {
+        assert!(validate_shell_safety("rm -rf notes.txt").is_err());
+        assert!(validate_shell_safety("git clean -fdx").is_err());
+        assert!(validate_shell_safety("bash -lc 'rm -rf notes.txt'").is_err());
+        assert!(validate_shell_safety("powershell -Command 'Remove-Item notes.txt'").is_err());
+        assert!(validate_shell_safety("powershell -EncodedCommand ZQBjAGgAbwA=").is_err());
+        assert!(validate_shell_safety("cargo test").is_ok());
+        assert!(validate_shell_safety("git status && cargo test").is_ok());
     }
 
     #[test]

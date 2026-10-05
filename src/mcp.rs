@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
 
@@ -625,6 +626,12 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
         "delete" => {
             properties.insert("path".to_string(), json!({ "type": "string" }));
             properties.insert("recursive".to_string(), json!({ "type": "boolean" }));
+            properties.insert("dryRun".to_string(), json!({ "type": "boolean" }));
+            properties.insert("kind".to_string(), json!({ "type": "string" }));
+            properties.insert(
+                "confirmationToken".to_string(),
+                json!({ "type": ["string", "null"] }),
+            );
         }
         "start_command" | "poll_command" | "cancel_command" => {
             for field in ["jobId", "command", "cwd", "state"] {
@@ -1039,12 +1046,14 @@ async fn handle_tools_list_with_show_detail_mode(
             tools.push(json!({
                 "name": "delete",
                 "title": "Delete path",
-                "description": "Delete file or directory in workspace.",
+                "description": "Delete a file or directory in the workspace. Run with dry_run=true first, then pass the returned confirmation_token to perform the delete.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "recursive": { "type": "boolean", "description": "Delete directories recursively" }
+                        "recursive": { "type": "boolean", "description": "Delete directories recursively" },
+                        "dry_run": { "type": "boolean", "description": "Preview the delete and return a short-lived confirmation token without removing anything" },
+                        "confirmation_token": { "type": "string", "description": "Token returned by a prior dry_run=true preview for the same path state" }
                     },
                     "required": ["path"]
                 },
@@ -1472,6 +1481,12 @@ async fn handle_start_command(
         } else {
             command_text.to_string()
         };
+    if let Err(error) = command::validate_shell_safety(&effective_command) {
+        return tool_error_response(
+            req,
+            format!("code: COMMAND_BLOCKED\nmessage: {error}"),
+        );
+    }
     let request_key = req.id.as_ref().map(|id| {
         let mut hasher = DefaultHasher::new();
         effective_command.hash(&mut hasher);
@@ -1642,6 +1657,13 @@ async fn handle_run_command(
         cmd.to_string()
     };
 
+    if let Err(error) = command::validate_shell_safety(&effective_command) {
+        return tool_error_response(
+            req,
+            format!("code: COMMAND_BLOCKED\nmessage: {error}"),
+        );
+    }
+
     if let Some(intercept) = command::detect_list_files_intercept(&effective_command) {
         let listing_path =
             match command::resolve_command_path(workspace_root, &cwd, intercept.path.as_deref()) {
@@ -1747,6 +1769,14 @@ fn resolve_intercepted_move_path(
     } else {
         destination_operand.clone()
     };
+
+    for (path, operation) in [(&from, "move source"), (&to, "move destination")] {
+        if let Err(error) =
+            validate_generic_file_tool_target(workspace_root, &path.to_string_lossy(), operation)
+        {
+            return Err(error);
+        }
+    }
 
     if intercept.overwrite && from != to {
         if let Ok(destination_meta) = std::fs::symlink_metadata(&to) {
@@ -2302,13 +2332,13 @@ Always specify the branch explicitly when using `git push`."#
         }
         if tool_mode.run_command_enabled() {
             lines.push(
-                "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files."
+                "For directory inspection, run_command can intercept plain listing commands such as find, tree, ls -R, and rg --files. Destructive shell commands such as rm, Remove-Item, git clean, format, shutdown, and reboot are blocked; use the dedicated delete preview/confirmation flow for filesystem deletion."
                     .to_string(),
             );
         }
         if tool_mode.write_tools_enabled() {
             lines.push(
-                "Use write with create_dirs=true to create files in new directories. Use edit for one or more guarded replace/range operations; the whole edit batch is atomic and range operations use 1-based inclusive line numbers plus exact old_text. Use plain mv commands for moves and renames. Use delete for other filesystem changes."
+                "Use write with create_dirs=true to create files in new directories. Use edit for one or more guarded replace/range operations; the whole edit batch is atomic and range operations use 1-based inclusive line numbers plus exact old_text. Use plain mv commands for moves and renames. For deletion, call delete with dry_run=true first, then pass its confirmation_token in the actual delete call."
                     .to_string(),
             );
         }
@@ -3513,12 +3543,58 @@ fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
     }
 }
 
+fn validate_generic_file_tool_target(
+    workspace_root: &str,
+    path: &str,
+    operation: &str,
+) -> Result<(), String> {
+    let root = Path::new(workspace_root)
+        .canonicalize()
+        .map(command::normalize_windows_verbatim_path)
+        .map_err(|e| e.to_string())?;
+    let target = command::resolve_workspace_path(workspace_root, Some(path))?;
+    if target == root {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target the workspace root"
+        ));
+    }
+    let relative = target
+        .strip_prefix(&root)
+        .map_err(|e| e.to_string())?
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if relative
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case(".git"))
+    {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target .git; use Git commands instead"
+        ));
+    }
+    if relative
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case(".catdesk"))
+    {
+        return Err(format!(
+            "code: PROTECTED_PATH\nmessage: {operation} cannot target .catdesk control files"
+        ));
+    }
+    Ok(())
+}
+
 fn handle_write_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(error) = validate_generic_file_tool_target(workspace_root, path, "write") {
+        return tool_error_response(req, error);
+    }
     let content = match arguments.get("content").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: content".into()),
@@ -3710,6 +3786,9 @@ fn handle_edit_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(error) = validate_generic_file_tool_target(workspace_root, path, "edit") {
+        return tool_error_response(req, error);
+    }
     let operations = match parse_edit_operations(&arguments) {
         Ok(operations) => operations,
         Err(error) => return tool_error_response(req, error),
@@ -3899,16 +3978,135 @@ fn optional_usize_argument(arguments: &Value, name: &str) -> Result<Option<usize
     }
 }
 
+fn delete_confirmation_fingerprint(path: &Path, recursive: bool) -> Result<u64, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let mut hasher = DefaultHasher::new();
+    path.display().to_string().hash(&mut hasher);
+    recursive.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    metadata.file_type().is_dir().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn delete_confirmation_token(path: &Path, recursive: bool) -> Result<String, String> {
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let fingerprint = delete_confirmation_fingerprint(path, recursive)?;
+    Ok(format!("delete:{issued_at}:{fingerprint:016x}"))
+}
+
+fn validate_delete_confirmation_token(
+    path: &Path,
+    recursive: bool,
+    token: &str,
+) -> Result<(), String> {
+    let mut parts = token.split(':');
+    if parts.next() != Some("delete") {
+        return Err("Use dry_run=true first and pass the returned confirmation_token.".into());
+    }
+    let issued_at = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| "Invalid delete confirmation token.".to_string())?;
+    let fingerprint = parts
+        .next()
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
+        .ok_or_else(|| "Invalid delete confirmation token.".to_string())?;
+    if parts.next().is_some() {
+        return Err("Invalid delete confirmation token.".into());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    if now.saturating_sub(issued_at) > 600 {
+        return Err("Delete confirmation token expired; run dry_run=true again.".into());
+    }
+    let expected = delete_confirmation_fingerprint(path, recursive)?;
+    if fingerprint != expected {
+        return Err("Delete confirmation token does not match the current path state.".into());
+    }
+    Ok(())
+}
+
 fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let path = match arguments.get("path").and_then(|v| v.as_str()) {
         Some(v) => v,
         None => return tool_error_response(req, "Missing required parameter: path".into()),
     };
+    if let Err(error) = validate_generic_file_tool_target(workspace_root, path, "delete") {
+        return tool_error_response(req, error);
+    }
     let recursive = arguments
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let confirmation_token = arguments
+        .get("confirmation_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let target = match command::resolve_workspace_path(workspace_root, Some(path)) {
+        Ok(value) => value,
+        Err(error) => {
+            return tool_error_response(
+                req,
+                format!("code: PATH_OUTSIDE_WORKSPACE\nmessage: {error}"),
+            );
+        }
+    };
+    let kind = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_dir() => "directory",
+        Ok(metadata) if metadata.file_type().is_file() => "file",
+        Ok(_) => "path",
+        Err(error) => return tool_error_response(req, format!("Path not found: {error}")),
+    };
+
+    if dry_run {
+        let token = match delete_confirmation_token(&target, recursive) {
+            Ok(value) => value,
+            Err(error) => return tool_error_response(req, error),
+        };
+        return tool_success_response_with_structured(
+            req,
+            format!(
+                "dry run: would delete {kind}: {}\nconfirmation_token: {token}",
+                target.display()
+            ),
+            json!({
+                "toolName": "delete",
+                "path": path,
+                "recursive": recursive,
+                "dryRun": true,
+                "kind": kind,
+                "confirmationToken": token,
+                "message": "dry run: path was not deleted",
+                "success": true,
+            }),
+        );
+    }
+
+    if let Err(error) = validate_delete_confirmation_token(&target, recursive, confirmation_token) {
+        return tool_error_response(
+            req,
+            format!("code: DELETE_CONFIRMATION_REQUIRED\nmessage: {error}"),
+        );
+    }
+
     match workspace_tools::delete_path(workspace_root, path, recursive) {
         Ok(text) => {
             let message = text.clone();
@@ -3919,7 +4117,11 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
                     "toolName": "delete",
                     "path": path,
                     "recursive": recursive,
+                    "dryRun": false,
+                    "kind": kind,
+                    "confirmationToken": Value::Null,
                     "message": message,
+                    "success": true,
                 }),
             )
         }
@@ -6934,15 +7136,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generic_file_tools_reject_workspace_control_paths() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-protected-path-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(workspace_root.join(".git")).expect("create git metadata");
+        std::fs::create_dir_all(workspace_root.join(".catdesk")).expect("create catdesk metadata");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        assert!(validate_generic_file_tool_target(&workspace_root_str, ".", "delete").is_err());
+        assert!(
+            validate_generic_file_tool_target(&workspace_root_str, ".git/config", "write")
+                .is_err()
+        );
+        assert!(
+            validate_generic_file_tool_target(&workspace_root_str, ".catdesk/session.md", "edit")
+                .is_err()
+        );
+        assert!(
+            validate_generic_file_tool_target(&workspace_root_str, "src/lib.rs", "write").is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn delete_confirmation_token_is_bound_to_current_path_state() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-delete-token-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let target = workspace_root.join("notes.txt");
+        std::fs::write(&target, "one\n").expect("write initial file");
+
+        let token = delete_confirmation_token(&target, false).expect("create token");
+        assert!(validate_delete_confirmation_token(&target, false, &token).is_ok());
+        std::fs::write(&target, "changed contents\n").expect("change file");
+        assert!(validate_delete_confirmation_token(&target, false, &token).is_err());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     #[tokio::test]
-    async fn delete_tool_returns_structured_message_without_text_content() {
+    async fn destructive_shell_commands_are_blocked_before_run_or_background_start() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-command-block-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace_root).expect("create workspace");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let run = handle_run_command(
+            &tool_call_request("run_command", json!({ "command": "rm -rf notes.txt" })),
+            &workspace_root_str,
+            false,
+            false,
+        )
+        .await;
+        assert!(result_text(&run).contains("COMMAND_BLOCKED"));
+
+        let manager = CommandJobManager::new();
+        let start = handle_start_command(
+            &tool_call_request("start_command", json!({ "command": "git clean -fdx" })),
+            &workspace_root_str,
+            false,
+            false,
+            &manager,
+            ShowDetailMode::Disable,
+        )
+        .await;
+        assert!(result_text(&start).contains("COMMAND_BLOCKED"));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn run_command_mv_intercept_rejects_protected_paths() {
+        let workspace_root =
+            std::env::temp_dir().join(format!("catdesk-mcp-protected-mv-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(workspace_root.join(".git")).expect("create git metadata");
+        std::fs::write(workspace_root.join("notes.txt"), "hello\n").expect("write source");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let response = handle_run_command(
+            &tool_call_request(
+                "run_command",
+                json!({ "command": "mv notes.txt .git/notes.txt" }),
+            ),
+            &workspace_root_str,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(result_text(&response).contains("PROTECTED_PATH"));
+        assert!(workspace_root.join("notes.txt").is_file());
+        assert!(!workspace_root.join(".git/notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
+    #[tokio::test]
+    async fn delete_tool_requires_preview_token_and_reports_structured_change() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-delete-file-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
         std::fs::write(workspace_root.join("notes.txt"), "hello world\n").expect("write file");
-
-        let req = tool_call_request("delete", json!({ "path": "notes.txt" }));
         let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let direct = handle_delete_path(
+            &tool_call_request("delete", json!({ "path": "notes.txt" })),
+            &workspace_root_str,
+        );
+        assert!(result_text(&direct).contains("DELETE_CONFIRMATION_REQUIRED"));
+        assert!(workspace_root.join("notes.txt").is_file());
+
+        let preview = handle_delete_path(
+            &tool_call_request(
+                "delete",
+                json!({ "path": "notes.txt", "dry_run": true }),
+            ),
+            &workspace_root_str,
+        );
+        let preview_structured = preview
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing preview structured content");
+        assert_eq!(
+            preview_structured.get("dryRun").and_then(Value::as_bool),
+            Some(true)
+        );
+        let token = preview_structured
+            .get("confirmationToken")
+            .and_then(Value::as_str)
+            .expect("missing confirmation token")
+            .to_string();
+        assert!(token.starts_with("delete:"));
+        assert!(workspace_root.join("notes.txt").is_file());
+
+        let req = tool_call_request(
+            "delete",
+            json!({ "path": "notes.txt", "confirmation_token": token }),
+        );
         let response = handle_tools_call(
             &req,
             &workspace_root_str,
@@ -6965,6 +7298,7 @@ mod tests {
             structured.get("message").and_then(Value::as_str),
             Some("deleted file: notes.txt")
         );
+        assert_eq!(structured.get("dryRun").and_then(Value::as_bool), Some(false));
         let widget_payload = response
             .result
             .as_ref()
@@ -6992,6 +7326,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("deleted")
         );
+        assert!(!workspace_root.join("notes.txt").exists());
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
