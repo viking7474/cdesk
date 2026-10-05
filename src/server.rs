@@ -1783,24 +1783,30 @@ mod tests {
         }
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
-        assert_eq!(widgets.len(), 10);
+        let expected_tool_names = vec![
+            "run_command",
+            "start_command",
+            "poll_command",
+            "cancel_command",
+            "verify_project",
+            "git_status_summary",
+            "git_diff_summary",
+            "catdesk_instruction",
+            "read",
+            "search_text",
+            "git_create_feature_branch",
+            "git_commit_verified",
+            "write",
+            "edit",
+            "delete",
+        ];
+        assert_eq!(widgets.len(), expected_tool_names.len());
         assert_eq!(
             widgets
                 .iter()
                 .map(|widget| widget.tool_name.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "run_command",
-                "start_command",
-                "poll_command",
-                "cancel_command",
-                "catdesk_instruction",
-                "read",
-                "search_text",
-                "write",
-                "edit",
-                "delete",
-            ]
+            expected_tool_names
         );
         assert!(widgets.iter().all(|widget| {
             widget.uri.contains("ui://widget/catdesk-dashboard.html")
