@@ -5,6 +5,7 @@ mod command;
 mod command_jobs;
 mod devtools;
 mod handoff;
+mod project_memory;
 mod git_workflow;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;

@@ -164,7 +164,7 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
   </tr>
 </table>
 
-- To improve performance and avoid high memory usage, we strongly recommend **opening a new session for every small feature**. Library handoff is disabled by default; enable it in TUI Settings only when ChatGPT Library Search is available and you want cross-chat continuity. When enabled, ask ChatGPT to use `create_handoff` before switching chats. CatDesk prepares a `catdesk_handoff_<workspace-name>_<short-id>.md` artifact containing the current goal, completed work, important decisions, validation, next steps, and Git context; ChatGPT then saves it to the persistent Library instead of writing the workspace. On the next session, `catdesk_instruction` tells ChatGPT to search Library using the full workspace identity prefix `catdesk_handoff_<workspace-name>_<short-id>`, not just the workspace name. With one exact workspace match it reads the handoff and deletes it only after a successful read; with multiple exact matches it asks which one to use first. Do not put credentials, tokens, passwords, or other secrets in a handoff. CatDesk can become extremely laggy after 50+ tool calls.
+- To improve performance and avoid high memory usage, we strongly recommend **opening a new session for every small feature**. CatDesk keeps workspace-local continuity in `.catdesk/session.md`: `project_memory_read` recovers it at the start of project work and `session_resume_update` refreshes it before ending substantive work. Library handoff remains disabled by default and is a separate portability layer for another chat, device, or workspace. Enable it in TUI Settings only when ChatGPT Library Search is available and you want that portable transfer. When enabled, `create_handoff` prepares a `catdesk_handoff_<workspace-name>_<short-id>.md` artifact for persistent Library storage without replacing the local session state. CatDesk prefers `.catdesk/session.md`; Library is searched only when local resume state is absent or the user explicitly requests a transferred handoff. Do not put credentials, tokens, passwords, or other secrets in either form of session context. CatDesk can become extremely laggy after 50+ tool calls.
 <p align="center">
   <img src="docs/images/high_ram_usage.png" alt="3.9 GB Memory usage🥹" width="300"><br>
   <em>3.9 GB Memory usage🥹</em>
@@ -201,13 +201,17 @@ CatDesk is a coding tool and a custom connector. Always use CatDesk if the user 
 
 # Tools
 
-CatDesk has two local tool modes: `multi-tools` exposes 15 tools by default (16 when Library handoff is enabled), and `read-only` exposes 3 tools by default (4 when Library handoff is enabled).
+CatDesk has two local tool modes: `multi-tools` exposes 19 tools by default (20 when Library handoff is enabled), and `read-only` exposes 4 tools by default (5 when Library handoff is enabled).
 
 CatDesk's local tools in `multi-tools` mode are:
 
 | Tool                        | Type   | What it does                                                               |
 | --------------------------- | ------ | -------------------------------------------------------------------------- |
 | `catdesk_instruction`       | Guide  | Returns CatDesk usage instructions and renders Binagotchy                  |
+| `project_memory_read`       | Read   | Reads local project/session memory from `.catdesk` without creating files  |
+| `project_memory_init`       | Write  | Creates missing local project-memory Markdown files under `.catdesk`       |
+| `project_memory_update`     | Write  | Appends to or overwrites a dedicated local memory document                 |
+| `session_resume_update`     | Write  | Refreshes `.catdesk/session.md` with structured resume state and Git facts |
 | `read`                      | Read   | Reads one or more text files from the workspace                            |
 | `search_text`               | Read   | Searches workspace text with `rg`, `grep`, or built-in search              |
 | `write`                     | Write  | Creates or overwrites a file                                               |
