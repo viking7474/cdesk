@@ -34,7 +34,7 @@ const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
 const WIDGET_RESOURCE_REVISION: u32 = 8;
 const DISCOVERY_TTL_MS: u64 = 30_000;
-const WIDGET_RESOURCE_TTL_MS: u64 = 60 * 60 * 1000;
+pub(crate) const WIDGET_RESOURCE_TTL_MS: u64 = 60 * 60 * 1000;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
@@ -7992,8 +7992,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[tokio::test]
+    async fn read_tool_defaults_to_conservative_mcp_byte_budget() {
+        let workspace_root = read_workspace("default-budget");
+        std::fs::write(
+            workspace_root.join("large.txt"),
+            filler(workspace_tools::DEFAULT_MCP_READ_BYTES + 4096),
+        )
+        .expect("write file");
+
+        let req = tool_call_request("read", json!({ "paths": ["large.txt"] }));
+        let response = handle_tools_call(
+            &req,
+            &workspace_root.to_string_lossy(),
+            1,
+            Mode::Both,
+            ToolMode::MultiTools,
+            false,
+            &CommandJobManager::new(),
+            &None,
+        )
+        .await;
+        let structured = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
+
+        assert_eq!(
+            structured["byteLimit"],
+            json!(workspace_tools::DEFAULT_MCP_READ_BYTES)
+        );
+        assert_eq!(
+            structured["bytes"],
+            json!(workspace_tools::DEFAULT_MCP_READ_BYTES)
+        );
+        assert_eq!(structured["batchTruncated"], json!(true));
+        assert_eq!(structured["files"][0]["budgetTruncated"], json!(true));
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     async fn read_batch(workspace_root: &Path, paths: Value) -> Value {
-        let req = tool_call_request("read", json!({ "paths": paths }));
+        // Legacy hard-cap semantics for the batch-behavior tests below. The
+        // MCP default is intentionally smaller and has its own regression test.
+        let req = tool_call_request(
+            "read",
+            json!({
+                "paths": paths,
+                "max_bytes": workspace_tools::MAX_READ_BATCH_BYTES,
+            }),
+        );
         handle_tools_call(
             &req,
             &workspace_root.to_string_lossy(),

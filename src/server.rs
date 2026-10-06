@@ -2058,7 +2058,7 @@ mod tests {
         mcp::decorate_modern_result("resources/read", &mut read_result);
         assert_eq!(
             read_result.get("ttlMs").and_then(Value::as_u64),
-            Some(5 * 60 * 1000)
+            Some(mcp::WIDGET_RESOURCE_TTL_MS)
         );
         assert_eq!(
             read_result.get("cacheScope").and_then(Value::as_str),
@@ -2891,7 +2891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_mcp_accumulates_usage_from_widget_payload_meta() {
+    async fn post_mcp_accumulates_usage_without_custom_widget_payload() {
         let workspace_root = unique_temp_path("catdesk-post-mcp-workspace");
         let config_root = unique_temp_path("catdesk-post-mcp-config");
         let config_path = config_root.join("config.toml");
@@ -2928,26 +2928,19 @@ mod tests {
             .expect("read response body");
         let payload: Value = serde_json::from_slice(&body).expect("parse json body");
 
-        let widget_payload = payload
-            .get("result")
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        let history_usage = widget_payload
-            .get("historyTurnTokenUsage")
-            .expect("missing history usage");
+        let result = payload.get("result").expect("missing result");
         assert!(
-            history_usage
-                .get("totalTokens")
-                .and_then(Value::as_u64)
-                .expect("history total tokens")
-                > 0
+            result
+                .get("_meta")
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command should remain on the host-native tool UI"
         );
-        assert_eq!(
-            widget_payload
-                .get("historyToolCallCount")
-                .and_then(Value::as_u64),
-            Some(1)
+        assert!(
+            result
+                .get("structuredContent")
+                .is_some(),
+            "native tool results must still provide structured content for usage estimation"
         );
 
         let app = app_state.lock().await;
