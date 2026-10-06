@@ -1,10 +1,10 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
@@ -365,7 +365,7 @@ pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
     uri == UI_TEMPLATE_URI || uri.starts_with(&format!("{UI_TEMPLATE_URI}?"))
 }
 
-fn render_widget_html(resource_uri: &str, _mascot_seed: u64) -> String {
+fn render_widget_html_uncached(resource_uri: &str) -> String {
     // Keep cached HTML deterministic across CatDesk process restarts. Live
     // mascot state is carried by tool result metadata after invocation.
     let initial_mascot_outline =
@@ -397,6 +397,34 @@ fn render_widget_html(resource_uri: &str, _mascot_seed: u64) -> String {
         // one stable resource URI/cache entry.
         .replace(INITIAL_TOOL_NAME_PLACEHOLDER, "")
         .replace(INITIAL_MASCOT_OUTLINE_PLACEHOLDER, &initial_mascot_outline)
+}
+
+fn render_widget_html(resource_uri: &str, _mascot_seed: u64) -> String {
+    static CACHE: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
+
+    // Cache only canonical CatDesk resource keys. resources/read intentionally
+    // tolerates older revisioned URIs, but arbitrary query strings must not be
+    // able to grow a process-local cache without bound.
+    let cacheable = resource_uri == UI_TEMPLATE_URI || resource_uri == current_widget_resource_uri();
+    if !cacheable {
+        return render_widget_html_uncached(resource_uri);
+    }
+
+    let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(html) = guard.get(resource_uri)
+    {
+        return html.clone();
+    }
+
+    let html = render_widget_html_uncached(resource_uri);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 8 && !guard.contains_key(resource_uri) {
+            guard.clear();
+        }
+        guard.insert(resource_uri.to_string(), html.clone());
+    }
+    html
 }
 
 #[cfg(test)]
@@ -8875,6 +8903,21 @@ mod tests {
         assert!(first.contains("tokenStatsLayout="));
         assert!(first.contains("widgetCornerStyle="));
         assert!(!first.contains("toolName="));
+    }
+
+    #[test]
+    fn widget_html_render_is_deterministic_and_legacy_uris_still_render() {
+        let canonical_uri = current_widget_resource_uri();
+        let first = render_widget_html(&canonical_uri, 1);
+        let second = render_widget_html(&canonical_uri, 999);
+        assert_eq!(first, second, "canonical widget HTML must be cache-stable");
+        assert!(first.contains(&canonical_uri));
+
+        let legacy_uri = format!(
+            "{UI_TEMPLATE_URI}?widgetRevision=7&tokenStatsLayout=bottom&widgetCornerStyle=rounded"
+        );
+        let legacy = render_widget_html(&legacy_uri, 123);
+        assert!(legacy.contains(&legacy_uri));
     }
 
     #[test]
