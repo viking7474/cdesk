@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 
 use crate::command_jobs::CommandJobManager;
@@ -26,6 +27,15 @@ use crate::state::{
 };
 
 const STATELESS_FLOW_ID: &str = "stateless";
+const PERF_SLOW_TOOL_MS: u128 = 500;
+const PERF_LARGE_RESPONSE_BYTES: usize = 64 * 1024;
+const PERF_AGGREGATE_EVERY_CALLS: u64 = 25;
+static MCP_PERF_CALLS: AtomicU64 = AtomicU64::new(0);
+static MCP_PERF_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
+static MCP_PERF_TOTAL_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static MCP_PERF_ERRORS: AtomicU64 = AtomicU64::new(0);
+static MCP_PERF_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static MCP_PERF_WIDGETS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct ServerState {
@@ -1785,15 +1795,9 @@ mod tests {
         let (success, widgets) = tracked.expect("missing bootstrap tools/list event");
         assert!(success);
         let expected_tool_names = vec![
-            "run_command",
-            "start_command",
-            "cancel_command",
             "verify_project",
-            "catdesk_instruction",
             "git_create_feature_branch",
             "git_commit_verified",
-            "write",
-            "edit",
             "delete",
         ];
         assert_eq!(widgets.len(), expected_tool_names.len());
@@ -3107,6 +3111,7 @@ async fn post_mcp_inner(
     }
 
     let show_detail_mode = show_detail_mode.unwrap_or(app_show_detail_mode);
+    let request_started = Instant::now();
     let response = mcp::handle_request_with_show_detail_mode(
         &req,
         &workspace_root,
@@ -3249,6 +3254,78 @@ async fn post_mcp_inner(
         StatusCode::OK
     };
     let response_body = serde_json::to_string(&response_json).unwrap();
+
+    if req.method == "tools/call" {
+        let elapsed_ms = request_started.elapsed().as_millis();
+        let response_bytes = response_body.len();
+        let tool_name = req
+            .params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let widget_attached = response_json
+            .get("result")
+            .and_then(|result| result.get("_meta"))
+            .and_then(Value::as_object)
+            .is_some_and(|meta| meta.contains_key(WIDGET_PAYLOAD_META_KEY));
+        let is_error = response_json.get("error").is_some()
+            || response_json
+                .get("result")
+                .and_then(|result| result.get("isError"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        let structured = response_json
+            .get("result")
+            .and_then(|result| result.get("structuredContent"));
+        let timed_out = structured
+            .and_then(|value| value.get("timedOut"))
+            .and_then(Value::as_bool)
+            == Some(true)
+            || structured
+                .and_then(|value| value.get("state"))
+                .and_then(Value::as_str)
+                == Some("timed_out");
+
+        let elapsed_ms_u64 = elapsed_ms.min(u64::MAX as u128) as u64;
+        let response_bytes_u64 = u64::try_from(response_bytes).unwrap_or(u64::MAX);
+        let call_count = MCP_PERF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        MCP_PERF_TOTAL_MS.fetch_add(elapsed_ms_u64, Ordering::Relaxed);
+        MCP_PERF_TOTAL_RESPONSE_BYTES.fetch_add(response_bytes_u64, Ordering::Relaxed);
+        if is_error {
+            MCP_PERF_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        if timed_out {
+            MCP_PERF_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if widget_attached {
+            MCP_PERF_WIDGETS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if elapsed_ms >= PERF_SLOW_TOOL_MS || response_bytes >= PERF_LARGE_RESPONSE_BYTES {
+            let _ = s.ui_events.send(ServerUiEvent::Log {
+                level: "INFO",
+                message: format!(
+                    "MCP perf tool={tool_name} elapsed_ms={elapsed_ms} response_bytes={response_bytes} widget={widget_attached} error={is_error} timed_out={timed_out}"
+                ),
+            });
+        }
+
+        if call_count % PERF_AGGREGATE_EVERY_CALLS == 0 {
+            let total_ms = MCP_PERF_TOTAL_MS.load(Ordering::Relaxed);
+            let total_bytes = MCP_PERF_TOTAL_RESPONSE_BYTES.load(Ordering::Relaxed);
+            let errors = MCP_PERF_ERRORS.load(Ordering::Relaxed);
+            let timeouts = MCP_PERF_TIMEOUTS.load(Ordering::Relaxed);
+            let widgets = MCP_PERF_WIDGETS.load(Ordering::Relaxed);
+            let _ = s.ui_events.send(ServerUiEvent::Log {
+                level: "INFO",
+                message: format!(
+                    "MCP perf aggregate calls={call_count} avg_ms={} avg_response_bytes={} errors={errors} timeouts={timeouts} widgets={widgets}",
+                    total_ms / call_count,
+                    total_bytes / call_count
+                ),
+            });
+        }
+    }
 
     Response::builder()
         .status(response_status)

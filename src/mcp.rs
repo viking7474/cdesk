@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::Mutex;
@@ -32,9 +32,9 @@ const SERVER_VERSION: &str = "4.0.0";
 pub(crate) const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const UI_TEMPLATE_URI: &str = "ui://widget/catdesk-dashboard.html";
-const WIDGET_RESOURCE_REVISION: u32 = 7;
+const WIDGET_RESOURCE_REVISION: u32 = 8;
 const DISCOVERY_TTL_MS: u64 = 30_000;
-const WIDGET_RESOURCE_TTL_MS: u64 = 5 * 60 * 1000;
+const WIDGET_RESOURCE_TTL_MS: u64 = 60 * 60 * 1000;
 const UI_TEMPLATE_MIME_TYPE: &str = "text/html;profile=mcp-app";
 pub(crate) const WIDGET_PAYLOAD_META_KEY: &str = "catdesk/widgetPayload";
 const CATDESK_WIDGET_HTML: &str = include_str!("widget/catdesk_dashboard.html");
@@ -351,17 +351,11 @@ fn handle_resources_list_with_show_detail_mode(
     )
 }
 
-fn widget_runtime_generation() -> u64 {
-    static GENERATION: OnceLock<u64> = OnceLock::new();
-    *GENERATION.get_or_init(rand::random::<u64>)
-}
-
 fn current_widget_resource_uri() -> String {
     let token_stats_layout = current_token_stats_layout();
     let widget_corner_style = current_widget_corner_style();
     format!(
-        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&runtimeGeneration={:016x}&tokenStatsLayout={}&widgetCornerStyle={}",
-        widget_runtime_generation(),
+        "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}",
         token_stats_layout.as_str(),
         widget_corner_style.as_str()
     )
@@ -371,9 +365,11 @@ pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
     uri == UI_TEMPLATE_URI || uri.starts_with(&format!("{UI_TEMPLATE_URI}?"))
 }
 
-fn render_widget_html(resource_uri: &str, mascot_seed: u64) -> String {
+fn render_widget_html(resource_uri: &str, _mascot_seed: u64) -> String {
+    // Keep cached HTML deterministic across CatDesk process restarts. Live
+    // mascot state is carried by tool result metadata after invocation.
     let initial_mascot_outline =
-        serde_json::to_string(&mascot::build_widget_mascot_outline(mascot_seed))
+        serde_json::to_string(&mascot::build_widget_mascot_outline(0))
             .unwrap_or_else(|_| "{}".to_string());
     let reenable_widget_image = format!(
         "data:image/png;base64,{}",
@@ -534,6 +530,10 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                 }),
             );
             properties.insert(
+                "byteLimit".to_string(),
+                json!({ "type": "integer", "minimum": 1 }),
+            );
+            properties.insert(
                 "batchTruncated".to_string(),
                 json!({
                     "type": "boolean",
@@ -566,6 +566,9 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
                             },
                             "text": { "type": "string" },
                             "truncated": { "type": "boolean" },
+                            "startLine": { "type": "integer", "minimum": 1 },
+                            "endLine": { "type": "integer", "minimum": 0 },
+                            "nextStartLine": { "type": ["integer", "null"], "minimum": 1 },
                             "budgetTruncated": {
                                 "type": "boolean",
                                 "description": "Cut by the shared budget, so asking for fewer files returns more of this one. A file truncated without this is over the per-file cap and no retry returns the rest."
@@ -589,6 +592,14 @@ fn local_tool_output_schema(name: &str) -> Option<Value> {
             properties.insert(
                 "searchLimit".to_string(),
                 json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "searchBytes".to_string(),
+                json!({ "type": "integer", "minimum": 0 }),
+            );
+            properties.insert(
+                "searchByteLimit".to_string(),
+                json!({ "type": "integer", "minimum": 1 }),
             );
             properties.insert(
                 "searchResults".to_string(),
@@ -1175,10 +1186,27 @@ async fn handle_tools_list_with_show_detail_mode(
                         "items": { "type": "string", "minLength": 1 },
                         "minItems": 1,
                         "maxItems": workspace_tools::MAX_READ_BATCH_FILES,
+                        "description": "File paths relative to workspace root, or absolute paths within it. Paths that resolve to the same file are read once."
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": workspace_tools::MAX_READ_BATCH_BYTES,
                         "description": format!(
-                            "File paths relative to workspace root, or absolute paths within it. Paths that resolve to the same file are read once. Combined text is capped at {} bytes; files past that return metadata only.",
+                            "Maximum returned text bytes across the call. Defaults to {} bytes; hard maximum is {} bytes.",
+                            workspace_tools::DEFAULT_MCP_READ_BYTES,
                             workspace_tools::MAX_READ_BATCH_BYTES
                         )
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based first line for ranged reading. Only valid when paths contains exactly one file."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional 1-based inclusive last line for ranged reading. Requires start_line and exactly one path."
                     }
                 },
                 "required": ["paths"]
@@ -1204,6 +1232,16 @@ async fn handle_tools_list_with_show_detail_mode(
                     "after": { "type": "integer", "description": "Context lines after each match (0..20)" },
                     "max_matches": { "type": "integer", "description": "Max returned matches (1..500, default 100)" },
                     "max_matches_per_file": { "type": "integer", "description": "Max matches per file (1..500)" },
+                    "max_bytes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": workspace_tools::MAX_SEARCH_RESPONSE_BYTES,
+                        "description": format!(
+                            "Approximate maximum bytes returned in searchResults. Defaults to {} bytes; hard maximum is {} bytes.",
+                            workspace_tools::DEFAULT_SEARCH_RESPONSE_BYTES,
+                            workspace_tools::MAX_SEARCH_RESPONSE_BYTES
+                        )
+                    },
                     "include_hidden": { "type": "boolean", "description": "Include dotfiles and dot-directories" },
                     "no_ignore": { "type": "boolean", "description": "Do not respect ignore files" }
                 },
@@ -1803,7 +1841,9 @@ async fn handle_start_command(
         timeout_ms.hash(&mut hasher);
         format!("start_command:{id}:{:016x}", hasher.finish())
     });
-    let change_session = (show_detail_mode != ShowDetailMode::Disable).then(|| {
+    let change_session = (show_detail_mode != ShowDetailMode::Disable
+        && tool_descriptor_should_attach_widget("start_command"))
+        .then(|| {
         ChangeSession::begin(
             Path::new(workspace_root),
             ChangeScope::single(ChangeTarget::discovered(cwd.clone(), true)),
@@ -2629,7 +2669,9 @@ fn catdesk_instruction_required_response_with_show_detail_mode(
         CATDESK_INSTRUCTION_REQUIRED_MESSAGE.into(),
         structured,
     );
-    if show_detail_mode == ShowDetailMode::Disable {
+    if show_detail_mode == ShowDetailMode::Disable
+        || !tool_descriptor_should_attach_widget("catdesk_instruction")
+    {
         return response;
     }
     if let Some(result) = response.result.as_mut() {
@@ -3048,7 +3090,9 @@ fn handle_catdesk_instruction_with_show_detail_mode(
             }
         };
     let mut response = tool_success_response_with_structured(req, instruction_text, structured);
-    if show_detail_mode == ShowDetailMode::Disable {
+    if show_detail_mode == ShowDetailMode::Disable
+        || !tool_descriptor_should_attach_widget("catdesk_instruction")
+    {
         return response;
     }
 
@@ -3192,15 +3236,9 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
     // long conversations.
     matches!(
         name,
-        "run_command"
-            | "start_command"
-            | "cancel_command"
-            | "verify_project"
+        "verify_project"
             | "git_create_feature_branch"
             | "git_commit_verified"
-            | "catdesk_instruction"
-            | "write"
-            | "edit"
             | "create_handoff"
             | "delete"
     )
@@ -4154,6 +4192,14 @@ async fn devtools_tool_is_read_only(
         .map(tool_is_read_only)
 }
 
+fn compact_workspace_error(error: &str) -> String {
+    error
+        .split_once(": ")
+        .map(|(reason, _)| reason)
+        .unwrap_or(error)
+        .to_string()
+}
+
 fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
     let items = arguments
         .get("paths")
@@ -4174,20 +4220,94 @@ fn parse_read_paths(arguments: &Value) -> Result<Vec<String>, String> {
 }
 
 fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
-    let paths = match parse_read_paths(&tool_arguments(req)) {
+    let arguments = tool_arguments(req);
+    let paths = match parse_read_paths(&arguments) {
         Ok(paths) => paths,
         Err(error) => return tool_error_response(req, error),
     };
-    match workspace_tools::read_files(workspace_root, &paths) {
+    let max_bytes = match optional_usize_argument(&arguments, "max_bytes") {
+        Ok(Some(value)) if (1..=workspace_tools::MAX_READ_BATCH_BYTES).contains(&value) => value,
+        Ok(Some(_)) => {
+            return tool_error_response(
+                req,
+                format!(
+                    "max_bytes must be between 1 and {}",
+                    workspace_tools::MAX_READ_BATCH_BYTES
+                ),
+            );
+        }
+        Ok(None) => workspace_tools::DEFAULT_MCP_READ_BYTES,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let start_line = match optional_usize_argument(&arguments, "start_line") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    let end_line = match optional_usize_argument(&arguments, "end_line") {
+        Ok(value) => value,
+        Err(error) => return tool_error_response(req, error),
+    };
+    if end_line.is_some() && start_line.is_none() {
+        return tool_error_response(req, "end_line requires start_line".into());
+    }
+
+    if let Some(start_line) = start_line {
+        if paths.len() != 1 {
+            return tool_error_response(
+                req,
+                "start_line/end_line are only supported when paths contains exactly one file".into(),
+            );
+        }
+        return match workspace_tools::read_file_range(
+            workspace_root,
+            &paths[0],
+            start_line,
+            end_line,
+            max_bytes,
+        ) {
+            Ok(output) => {
+                let budget_truncated = output.truncated && output.next_start_line.is_some();
+                let response_path = output.path.clone();
+                let file = json!({
+                    "path": output.path,
+                    "bytes": output.bytes,
+                    "sizeBytes": output.size_bytes,
+                    "lineCount": output.line_count,
+                    "text": output.text,
+                    "truncated": output.truncated,
+                    "budgetTruncated": budget_truncated,
+                    "startLine": output.start_line,
+                    "endLine": output.end_line,
+                    "nextStartLine": output.next_start_line,
+                });
+                tool_success_response_with_structured(
+                    req,
+                    String::new(),
+                    json!({
+                        "toolName": "read",
+                        "path": response_path,
+                        "bytes": output.bytes,
+                        "sizeBytes": output.size_bytes,
+                        "lineCount": output.line_count,
+                        "fileCount": 1,
+                        "byteLimit": max_bytes,
+                        "batchTruncated": output.truncated,
+                        "files": [file],
+                    }),
+                )
+            }
+            Err(error) => tool_error_response(req, compact_workspace_error(&error)),
+        };
+    }
+
+    match workspace_tools::read_files_with_budget(workspace_root, &paths, max_bytes) {
         Ok(mut output) => {
             // The structured entry already carries the requested workspace-relative
             // path. Keep per-file errors compact and avoid echoing resolved absolute
             // paths (especially temp paths on Windows) back into the MCP payload.
             for file in &mut output.files {
                 if let Some(error) = file.error.as_mut() {
-                    if let Some((reason, _)) = error.split_once(": ") {
-                        *error = reason.to_string();
-                    }
+                    *error = compact_workspace_error(error);
                 }
             }
             let structured = json!({
@@ -4208,6 +4328,7 @@ fn handle_read_files(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespo
                 "sizeBytes": output.files.iter().map(|f| f.size_bytes).sum::<u64>(),
                 "lineCount": output.total_line_count,
                 "fileCount": output.files.len(),
+                "byteLimit": max_bytes,
                 "batchTruncated": output.batch_truncated,
                 "files": output.files,
             });
@@ -4620,6 +4741,51 @@ fn handle_edit_file(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcRespon
     }
 }
 
+fn floor_utf8_boundary(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut index = max_bytes;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn bound_search_results(
+    output: &mut workspace_tools::SearchTextOutput,
+    byte_limit: usize,
+) -> usize {
+    let mut used = 0usize;
+    let mut kept = Vec::with_capacity(output.results.len());
+
+    for mut entry in output.results.drain(..) {
+        // Include a conservative allowance for path/line/JSON framing so the
+        // actual structured payload stays close to the requested budget.
+        let overhead = entry.path.len().saturating_add(64);
+        if used.saturating_add(overhead) >= byte_limit {
+            output.truncated = true;
+            break;
+        }
+        let available = byte_limit - used - overhead;
+        if entry.text.len() > available {
+            let keep = floor_utf8_boundary(&entry.text, available);
+            entry.text.truncate(keep);
+            output.truncated = true;
+            used = used.saturating_add(overhead).saturating_add(entry.text.len());
+            kept.push(entry);
+            break;
+        }
+        used = used
+            .saturating_add(overhead)
+            .saturating_add(entry.text.len());
+        kept.push(entry);
+    }
+
+    output.results = kept;
+    used
+}
+
 fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResponse {
     let arguments = tool_arguments(req);
     let pattern = match required_string_argument(&arguments, "pattern") {
@@ -4662,6 +4828,20 @@ fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
         Ok(value) => value,
         Err(e) => return tool_error_response(req, e),
     };
+    let max_bytes = match optional_usize_argument(&arguments, "max_bytes") {
+        Ok(Some(value)) if (1..=workspace_tools::MAX_SEARCH_RESPONSE_BYTES).contains(&value) => value,
+        Ok(Some(_)) => {
+            return tool_error_response(
+                req,
+                format!(
+                    "max_bytes must be between 1 and {}",
+                    workspace_tools::MAX_SEARCH_RESPONSE_BYTES
+                ),
+            );
+        }
+        Ok(None) => workspace_tools::DEFAULT_SEARCH_RESPONSE_BYTES,
+        Err(e) => return tool_error_response(req, e),
+    };
     let include_hidden = match optional_bool_argument(&arguments, "include_hidden", false) {
         Ok(value) => value,
         Err(e) => return tool_error_response(req, e),
@@ -4687,21 +4867,26 @@ fn handle_search_text(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
             no_ignore,
         },
     ) {
-        Ok(output) => tool_success_response_with_structured(
-            req,
-            output.render_text(),
-            json!({
-                "toolName": "search_text",
-                "searchPattern": output.pattern,
-                "searchPath": output.path,
-                "searchBackend": output.backend,
-                "searchBackendNote": output.backend_note,
-                "matchCount": output.match_count,
-                "searchTruncated": output.truncated,
-                "searchLimit": output.limit,
-                "searchResults": output.results,
-            }),
-        ),
+        Ok(mut output) => {
+            let response_bytes = bound_search_results(&mut output, max_bytes);
+            tool_success_response_with_structured(
+                req,
+                output.render_text(),
+                json!({
+                    "toolName": "search_text",
+                    "searchPattern": output.pattern,
+                    "searchPath": output.path,
+                    "searchBackend": output.backend,
+                    "searchBackendNote": output.backend_note,
+                    "matchCount": output.match_count,
+                    "searchTruncated": output.truncated,
+                    "searchLimit": output.limit,
+                    "searchBytes": response_bytes,
+                    "searchByteLimit": max_bytes,
+                    "searchResults": output.results,
+                }),
+            )
+        },
         Err(e) => tool_error_response(req, e),
     }
 }
@@ -5147,15 +5332,14 @@ mod tests {
             start_structured.get("state").and_then(Value::as_str),
             Some("running")
         );
-        assert_eq!(
+        assert!(
             start_response
                 .result
                 .as_ref()
                 .and_then(|result| result.get("_meta"))
                 .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-                .and_then(|payload| payload.get("toolName"))
-                .and_then(Value::as_str),
-            Some("start_command")
+                .is_none(),
+            "start_command should use the host-native lightweight tool UI"
         );
 
         let mut terminal = None;
@@ -5471,8 +5655,7 @@ mod tests {
     }
 
     #[test]
-    fn original_run_command_widget_shape_is_unchanged_by_new_runtime_metadata() {
-        let req = tool_call_request("run_command", json!({ "command": "cargo check" }));
+    fn run_command_widget_builder_shape_is_unchanged_when_called_directly() {
         let raw = json!({
             "content": [],
             "structuredContent": {
@@ -5489,11 +5672,8 @@ mod tests {
                 "stderrTruncated": false
             }
         });
-        let result = enrich_tool_result(&req, raw, None);
-        let payload = result
-            .get("_meta")
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing run_command widget payload");
+        let payload = build_run_command_widget_payload(&raw, None, false)
+            .expect("run_command widget builder payload");
         assert_eq!(
             payload.get("toolName").and_then(Value::as_str),
             Some("run_command")
@@ -6200,9 +6380,15 @@ mod tests {
             .expect("missing tools");
 
         for tool_name in [
+            "catdesk_instruction",
+            "run_command",
+            "start_command",
+            "poll_command",
+            "cancel_command",
             "read",
             "search_text",
-            "poll_command",
+            "write",
+            "edit",
             "git_status_summary",
             "git_diff_summary",
         ] {
@@ -6222,9 +6408,15 @@ mod tests {
     #[test]
     fn non_widget_tool_results_skip_widget_enrichment() {
         for tool_name in [
+            "catdesk_instruction",
+            "run_command",
+            "start_command",
+            "poll_command",
+            "cancel_command",
             "read",
             "search_text",
-            "poll_command",
+            "write",
+            "edit",
             "git_status_summary",
             "git_diff_summary",
         ] {
@@ -6327,40 +6519,14 @@ mod tests {
             Some(CATDESK_INSTRUCTION_REQUIRED_MESSAGE)
         );
         assert!(result_text(&blocked).contains("Call catdesk_instruction successfully"));
-        let blocked_widget = blocked
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing instruction-required widget payload");
-        assert_eq!(
-            blocked_widget.get("payloadKind").and_then(Value::as_str),
-            Some("instruction_required")
-        );
-        assert_eq!(
-            blocked_widget.get("title").and_then(Value::as_str),
-            Some("read")
-        );
-        assert_eq!(
-            blocked_widget.get("state").and_then(Value::as_str),
-            Some("failed")
-        );
-        assert_eq!(
-            blocked_widget.get("toolName").and_then(Value::as_str),
-            Some("read")
-        );
-        assert_eq!(
-            blocked_widget.get("title").and_then(Value::as_str),
-            Some("read")
-        );
-        assert!(blocked_widget.get("call").is_none());
-        assert_eq!(
-            blocked_widget.get("detail").and_then(Value::as_str),
-            Some(CATDESK_INSTRUCTION_REQUIRED_WIDGET_MESSAGE)
-        );
-        assert_eq!(
-            blocked_widget.get("hasChanges").and_then(Value::as_bool),
-            Some(false)
+        assert!(
+            blocked
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "instruction gate should stay on the host-native tool UI"
         );
 
         let allowed = handle_request(
@@ -6819,6 +6985,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
+    #[test]
+    fn search_results_respect_response_byte_budget() {
+        let mut output = workspace_tools::SearchTextOutput {
+            pattern: "needle".into(),
+            path: ".".into(),
+            backend: "test".into(),
+            backend_note: String::new(),
+            match_count: 2,
+            truncated: false,
+            limit: 100,
+            results: vec![
+                workspace_tools::SearchTextEntry {
+                    path: "src/a.rs".into(),
+                    line: 1,
+                    text: "x".repeat(256),
+                    is_context: false,
+                },
+                workspace_tools::SearchTextEntry {
+                    path: "src/b.rs".into(),
+                    line: 2,
+                    text: "y".repeat(256),
+                    is_context: false,
+                },
+            ],
+        };
+
+        let bytes = bound_search_results(&mut output, 128);
+
+        assert!(bytes <= 128);
+        assert!(output.truncated);
+        assert!(!output.results.is_empty());
+        assert!(output.results.iter().all(|entry| entry.text.len() < 256));
+    }
+
     #[tokio::test]
     async fn search_tool_returns_matches_without_custom_widget_payload() {
         let workspace_root =
@@ -6903,7 +7103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_file_widget_payload_includes_changed_files_after_tool_call() {
+    async fn write_file_uses_structured_result_without_custom_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-write-file-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -6929,44 +7129,28 @@ mod tests {
         .await;
 
         assert_no_text_content(&response);
-        let widget_payload = response
+        let structured = response
             .result
             .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-
+            .and_then(|result| result.get("structuredContent"))
+            .expect("missing structured content");
         assert_eq!(
-            widget_payload.get("toolName").and_then(Value::as_str),
+            structured.get("toolName").and_then(Value::as_str),
             Some("write")
         );
+        assert_eq!(structured.get("path").and_then(Value::as_str), Some("notes.txt"));
         assert_eq!(
-            widget_payload.get("path").and_then(Value::as_str),
-            Some("notes.txt")
-        );
-        assert_eq!(
-            widget_payload.get("bytesWritten").and_then(Value::as_u64),
+            structured.get("bytesWritten").and_then(Value::as_u64),
             Some(12)
         );
-        assert_eq!(
-            widget_payload.get("hasChanges").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            widget_payload
-                .get("changedFiles")
-                .and_then(Value::as_array)
-                .map(|files| files.len()),
-            Some(1)
-        );
-        assert_eq!(
-            widget_payload
-                .get("changedFiles")
-                .and_then(Value::as_array)
-                .and_then(|files| files.first())
-                .and_then(|file| file.get("path"))
-                .and_then(Value::as_str),
-            Some("notes.txt")
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "write should use the host-native lightweight tool UI"
         );
 
         let _ = std::fs::remove_file(workspace_root.join("notes.txt"));
@@ -7265,7 +7449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_applies_atomic_batch_and_reports_changed_file() {
+    async fn edit_file_applies_atomic_batch_without_custom_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-edit-file-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -7334,52 +7518,18 @@ mod tests {
             Some(2)
         );
 
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
         assert_eq!(
-            widget_payload.get("toolName").and_then(Value::as_str),
-            Some("edit")
-        );
-        assert_eq!(
-            widget_payload.get("path").and_then(Value::as_str),
-            Some("notes.txt")
-        );
-        assert_eq!(
-            widget_payload.get("bytesWritten").and_then(Value::as_u64),
+            structured.get("bytesWritten").and_then(Value::as_u64),
             Some(17)
         );
-        assert_eq!(
-            widget_payload.get("operationCount").and_then(Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            widget_payload
-                .get("appliedOperations")
-                .and_then(Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            widget_payload
-                .get("replacedOccurrences")
-                .and_then(Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            widget_payload.get("hasChanges").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            widget_payload
-                .get("changedFiles")
-                .and_then(Value::as_array)
-                .and_then(|files| files.first())
-                .and_then(|file| file.get("path"))
-                .and_then(Value::as_str),
-            Some("notes.txt")
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "edit should use the host-native lightweight tool UI"
         );
 
         let _ = std::fs::remove_file(workspace_root.join("notes.txt"));
@@ -7441,7 +7591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_listing_intercept_uses_list_widget_payload() {
+    async fn run_command_listing_intercept_stays_structured_without_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-run-command-list-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
@@ -7473,12 +7623,6 @@ mod tests {
             .as_ref()
             .and_then(|result| result.get("structuredContent"))
             .expect("missing structured content");
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
 
         assert_eq!(
             structured.get("toolName").and_then(Value::as_str),
@@ -7497,19 +7641,24 @@ mod tests {
             Some("find")
         );
         assert_eq!(
-            widget_payload.get("toolName").and_then(Value::as_str),
-            Some("list_files")
-        );
-        assert_eq!(
-            widget_payload.get("listPath").and_then(Value::as_str),
+            structured.get("listPath").and_then(Value::as_str),
             Some("src")
         );
         assert_eq!(
-            widget_payload
+            structured
                 .get("listEntries")
                 .and_then(Value::as_array)
                 .map(|entries| entries.len()),
             Some(1)
+        );
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command listing intercept should stay on the host-native tool UI"
         );
 
         let _ = std::fs::remove_file(workspace_root.join("src/lib.rs"));
@@ -7517,7 +7666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_ls_listing_intercept_uses_run_command_widget_payload() {
+    async fn run_command_ls_listing_intercept_stays_structured_without_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-run-command-ls-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join("src")).expect("create workspace");
@@ -7549,12 +7698,6 @@ mod tests {
             .as_ref()
             .and_then(|result| result.get("structuredContent"))
             .expect("missing structured content");
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
 
         assert_eq!(
             structured.get("toolName").and_then(Value::as_str),
@@ -7572,19 +7715,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("ls")
         );
-        assert_eq!(
-            widget_payload.get("toolName").and_then(Value::as_str),
-            Some("run_command")
-        );
-        assert_eq!(
-            widget_payload.get("command").and_then(Value::as_str),
-            Some("ls -Ra src")
+        assert!(
+            structured
+                .get("listEntries")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| {
+                    entry.get("path").and_then(Value::as_str) == Some("src/lib.rs")
+                }))
         );
         assert!(
-            widget_payload
-                .get("output")
-                .and_then(Value::as_str)
-                .is_some_and(|output| output.contains("file src/lib.rs"))
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command ls intercept should stay on the host-native tool UI"
         );
 
         let _ = std::fs::remove_file(workspace_root.join("src/lib.rs"));
@@ -7592,7 +7738,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_mv_intercept_moves_into_directory_and_reports_changed_files() {
+    async fn run_command_mv_intercept_moves_into_directory_without_custom_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-run-command-mv-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join("dest")).expect("create workspace");
@@ -7648,32 +7794,21 @@ mod tests {
             structured.get("resolvedTo").and_then(Value::as_str),
             Some("dest/old.txt")
         );
-
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        assert_eq!(
-            widget_payload.get("hasChanges").and_then(Value::as_bool),
-            Some(true)
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command mv intercept should stay on the host-native tool UI"
         );
-        let changed_paths = widget_payload
-            .get("changedFiles")
-            .and_then(Value::as_array)
-            .expect("missing changed files")
-            .iter()
-            .filter_map(|file| file.get("path").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(changed_paths.contains(&"old.txt"));
-        assert!(changed_paths.contains(&"dest/old.txt"));
 
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
-    async fn run_command_mv_intercept_no_clobber_skips_existing_destination() {
+    async fn run_command_mv_intercept_no_clobber_skips_without_custom_widget() {
         let workspace_root = std::env::temp_dir().join(format!(
             "catdesk-mcp-run-command-mv-no-clobber-{}",
             Uuid::new_v4()
@@ -7729,16 +7864,14 @@ mod tests {
             structured.get("skipped").and_then(Value::as_bool),
             Some(true)
         );
-
-        let widget_payload = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .expect("missing widget payload");
-        assert_eq!(
-            widget_payload.get("hasChanges").and_then(Value::as_bool),
-            Some(false)
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command mv no-clobber should stay on the host-native tool UI"
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -7776,15 +7909,14 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some()
         );
-        assert_eq!(
+        assert!(
             response
                 .result
                 .as_ref()
                 .and_then(|result| result.get("_meta"))
                 .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-                .and_then(|payload| payload.get("showDetailMode"))
-                .and_then(Value::as_str),
-            Some("expanded")
+                .is_none(),
+            "catdesk_instruction should use the host-native lightweight tool UI"
         );
 
         let _ = std::fs::remove_dir_all(workspace_root);
@@ -8686,12 +8818,14 @@ mod tests {
 
     #[test]
     fn widget_resource_uri_is_shared_and_revisioned_for_cache_busting() {
-        let uri = current_widget_resource_uri();
-        assert!(uri.contains("widgetRevision=7"));
-        assert!(uri.contains("runtimeGeneration="));
-        assert!(uri.contains("tokenStatsLayout="));
-        assert!(uri.contains("widgetCornerStyle="));
-        assert!(!uri.contains("toolName="));
+        let first = current_widget_resource_uri();
+        let second = current_widget_resource_uri();
+        assert_eq!(first, second, "widget cache key must be deterministic");
+        assert!(first.contains("widgetRevision=8"));
+        assert!(!first.contains("runtimeGeneration="));
+        assert!(first.contains("tokenStatsLayout="));
+        assert!(first.contains("widgetCornerStyle="));
+        assert!(!first.contains("toolName="));
     }
 
     #[test]
@@ -8970,12 +9104,14 @@ mod tests {
 
     #[test]
     fn show_detail_modes_are_injectable_for_widget_enrichment() {
-        let req = tool_call_request("run_command", json!({}));
+        let req = tool_call_request("delete", json!({ "path": "notes.txt" }));
         let raw = json!({
-            "content": [{ "type": "text", "text": "hello" }],
+            "content": [{ "type": "text", "text": "deleted" }],
             "structuredContent": {
-                "toolName": "run_command",
-                "command": "echo hello"
+                "toolName": "delete",
+                "path": "notes.txt",
+                "message": "deleted file: notes.txt",
+                "success": true
             }
         });
 
@@ -9007,7 +9143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_change_tracking_excludes_vcs_admin_paths() {
+    async fn run_command_native_ui_skips_widget_change_tracking() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-vcs-diff-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join(".git")).expect("create git metadata");
@@ -9031,25 +9167,27 @@ mod tests {
             &None,
         )
         .await;
-        let changed_files = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("_meta"))
-            .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
-            .and_then(|payload| payload.get("changedFiles"))
-            .and_then(Value::as_array)
-            .expect("missing changed files");
-        let paths = changed_files
-            .iter()
-            .filter_map(|file| file.get("path").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(paths.contains(&"visible.txt"));
-        assert!(paths.iter().all(|path| !path.starts_with(".git/")));
+
+        assert!(
+            std::fs::read_to_string(workspace_root.join("visible.txt"))
+                .expect("read visible file")
+                .contains("after")
+        );
+        assert!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("_meta"))
+                .and_then(|meta| meta.get(WIDGET_PAYLOAD_META_KEY))
+                .is_none(),
+            "run_command should not create widget change-tracking payloads"
+        );
+
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 
     #[tokio::test]
-    async fn background_command_tracks_changes_without_poll_widget_or_vcs_admin_noise() {
+    async fn background_command_native_ui_skips_change_tracking_and_poll_widget() {
         let workspace_root =
             std::env::temp_dir().join(format!("catdesk-mcp-job-diff-{}", Uuid::new_v4()));
         std::fs::create_dir_all(workspace_root.join(".git")).expect("create git metadata");
@@ -9127,16 +9265,14 @@ mod tests {
                 .is_none(),
             "poll_command must stay on the host-native lightweight tool UI"
         );
-        let changes = command_jobs
-            .current_changes(&job_id)
-            .await
-            .expect("read job changes");
-        let paths = changes
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        assert!(paths.contains(&"visible.txt"));
-        assert!(paths.iter().all(|path| !path.starts_with(".git/")));
+        assert!(
+            command_jobs
+                .current_changes(&job_id)
+                .await
+                .expect("read job changes")
+                .is_empty(),
+            "widget-free start_command must not retain a background change session"
+        );
         let _ = std::fs::remove_dir_all(workspace_root);
     }
 

@@ -10,10 +10,14 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
-/// Per-file cap; MAX_READ_BATCH_BYTES caps the whole batch.
+/// Per-file hard cap. MCP callers use a much smaller default response budget
+/// and may opt into a larger budget up to MAX_READ_BATCH_BYTES.
 const MAX_READ_BYTES: usize = 512 * 1024;
 pub const MAX_READ_BATCH_FILES: usize = 32;
+pub const DEFAULT_MCP_READ_BYTES: usize = 64 * 1024;
 pub const MAX_READ_BATCH_BYTES: usize = 512 * 1024;
+pub const DEFAULT_SEARCH_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MAX_SEARCH_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 512 * 1024;
 const DEFAULT_LIST_LIMIT: usize = 200;
 const HARD_LIST_LIMIT: usize = 1000;
@@ -324,6 +328,111 @@ pub struct ReadBatchOutput {
     pub batch_truncated: bool,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadRangeOutput {
+    pub path: String,
+    pub bytes: usize,
+    pub size_bytes: u64,
+    pub line_count: usize,
+    pub text: String,
+    pub truncated: bool,
+    pub start_line: usize,
+    pub end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_start_line: Option<usize>,
+}
+
+pub fn read_file_range(
+    workspace_root: &str,
+    path: &str,
+    start_line: usize,
+    end_line: Option<usize>,
+    byte_budget: usize,
+) -> Result<ReadRangeOutput, String> {
+    if start_line == 0 {
+        return Err("start_line is 1-based and must be at least 1".into());
+    }
+    if end_line.is_some_and(|end| end < start_line) {
+        return Err("end_line must be greater than or equal to start_line".into());
+    }
+    if byte_budget == 0 || byte_budget > MAX_READ_BATCH_BYTES {
+        return Err(format!(
+            "max_bytes must be between 1 and {MAX_READ_BATCH_BYTES}"
+        ));
+    }
+
+    let root = workspace_root_path(workspace_root)?;
+    let target = resolve_target_path(workspace_root, path)?;
+    let size_bytes = readable_size(&target)?;
+    let file = fs::File::open(&target).map_err(|error| format!("{error}: {}", target.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line_no = 1usize;
+    let mut line = Vec::new();
+    let mut bytes = Vec::with_capacity(byte_budget.min(64 * 1024));
+    let mut returned_end = start_line.saturating_sub(1);
+    let mut truncated = false;
+    let mut next_start_line = None;
+
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if line_no < start_line {
+            line_no = line_no.saturating_add(1);
+            continue;
+        }
+        if end_line.is_some_and(|end| line_no > end) {
+            break;
+        }
+
+        if bytes.len().saturating_add(line.len()) > byte_budget {
+            if bytes.is_empty() {
+                let keep = byte_budget.min(line.len());
+                bytes.extend_from_slice(&line[..keep]);
+                returned_end = line_no;
+                // A single logical line larger than the byte budget cannot be
+                // resumed with line-based continuation without duplicating or
+                // skipping bytes, so expose truncation without nextStartLine.
+                truncated = keep < line.len();
+            } else {
+                truncated = true;
+                next_start_line = Some(line_no);
+            }
+            break;
+        }
+
+        bytes.extend_from_slice(&line);
+        returned_end = line_no;
+        line_no = line_no.saturating_add(1);
+    }
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.len() > byte_budget {
+        let keep = floor_char_boundary(&text, byte_budget);
+        text.truncate(keep);
+        truncated = true;
+        next_start_line = None;
+    }
+    Ok(ReadRangeOutput {
+        path: to_workspace_relative(&root, &target),
+        bytes: text.len(),
+        size_bytes,
+        line_count: if returned_end >= start_line {
+            returned_end - start_line + 1
+        } else {
+            0
+        },
+        text,
+        truncated,
+        start_line,
+        end_line: returned_end,
+        next_start_line,
+    })
+}
+
 fn floor_char_boundary(text: &str, max: usize) -> usize {
     if max >= text.len() {
         return text.len();
@@ -392,7 +501,22 @@ fn read_order(planned: &[PlannedRead]) -> Vec<usize> {
 }
 
 /// Entries come back in the order requested, whatever order they were read in.
+/// This compatibility wrapper preserves the historical hard-cap behavior for
+/// internal callers and tests. MCP requests should use read_files_with_budget.
 pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOutput, String> {
+    read_files_with_budget(workspace_root, paths, MAX_READ_BATCH_BYTES)
+}
+
+pub fn read_files_with_budget(
+    workspace_root: &str,
+    paths: &[String],
+    byte_budget: usize,
+) -> Result<ReadBatchOutput, String> {
+    if byte_budget == 0 || byte_budget > MAX_READ_BATCH_BYTES {
+        return Err(format!(
+            "max_bytes must be between 1 and {MAX_READ_BATCH_BYTES}"
+        ));
+    }
     if paths.is_empty() {
         return Err("paths must contain at least one path".into());
     }
@@ -410,7 +534,7 @@ pub fn read_files(workspace_root: &str, paths: &[String]) -> Result<ReadBatchOut
         .collect();
 
     let mut entries: Vec<Option<ReadBatchEntry>> = (0..paths.len()).map(|_| None).collect();
-    let mut remaining = MAX_READ_BATCH_BYTES;
+    let mut remaining = byte_budget;
     let mut batch_truncated = false;
     let mut total_bytes = 0_usize;
     let mut total_line_count = 0_usize;
@@ -1677,6 +1801,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("src/a.rs", 1, "alpha1")]
         );
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn read_files_with_budget_respects_smaller_mcp_budget() {
+        let workspace_root = test_workspace("read-budget");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(workspace_root.join("large.txt"), "x".repeat(8 * 1024))
+            .expect("write large file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let output = read_files_with_budget(
+            &workspace_root_str,
+            &["large.txt".to_string()],
+            1024,
+        )
+        .expect("read with budget");
+
+        assert_eq!(output.total_bytes, 1024);
+        assert!(output.batch_truncated);
+        assert_eq!(output.files.len(), 1);
+        assert!(output.files[0].truncated);
+        assert!(output.files[0].budget_truncated);
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn read_file_range_returns_line_aligned_continuation() {
+        let workspace_root = test_workspace("read-range");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let content = (1..=10)
+            .map(|line| format!("line-{line:02}\n"))
+            .collect::<String>();
+        fs::write(workspace_root.join("lines.txt"), content).expect("write ranged file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let output = read_file_range(
+            &workspace_root_str,
+            "lines.txt",
+            3,
+            None,
+            "line-03\nline-04\n".len(),
+        )
+        .expect("read range");
+
+        assert_eq!(output.start_line, 3);
+        assert_eq!(output.end_line, 4);
+        assert_eq!(output.next_start_line, Some(5));
+        assert_eq!(output.text, "line-03\nline-04\n");
+        assert!(output.truncated);
+
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    #[test]
+    fn read_file_range_honors_requested_end_line_without_false_truncation() {
+        let workspace_root = test_workspace("read-range-end");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::write(
+            workspace_root.join("lines.txt"),
+            "one\ntwo\nthree\nfour\n",
+        )
+        .expect("write ranged file");
+        let workspace_root_str = workspace_root.to_string_lossy().into_owned();
+
+        let output = read_file_range(
+            &workspace_root_str,
+            "lines.txt",
+            2,
+            Some(3),
+            DEFAULT_MCP_READ_BYTES,
+        )
+        .expect("read bounded range");
+
+        assert_eq!(output.text, "two\nthree\n");
+        assert_eq!(output.start_line, 2);
+        assert_eq!(output.end_line, 3);
+        assert_eq!(output.next_start_line, None);
+        assert!(!output.truncated);
 
         let _ = fs::remove_dir_all(workspace_root);
     }

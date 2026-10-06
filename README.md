@@ -207,7 +207,7 @@ CatDesk's local tools in `multi-tools` mode are:
 
 | Tool                        | Type   | What it does                                                               |
 | --------------------------- | ------ | -------------------------------------------------------------------------- |
-| `catdesk_instruction`       | Guide  | Returns CatDesk usage instructions and renders Binagotchy                  |
+| `catdesk_instruction`       | Guide  | Returns CatDesk usage instructions using the host-native tool UI           |
 | `project_memory_read`       | Read   | Reads local project/session memory from `.catdesk` without creating files  |
 | `project_memory_init`       | Write  | Creates missing local project-memory Markdown files under `.catdesk`       |
 | `project_memory_update`     | Write  | Appends to or overwrites a dedicated local memory document                 |
@@ -234,7 +234,11 @@ Long-running commands are deliberately decoupled from the lifetime of an MCP HTT
 
 If browser mode is enabled, CatDesk can also expose extra browser/devtools tools. Those are provided by the browser bridge, so the exact list depends on your environment.
 
-`search_text` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Installing ripgrep is optional, but gives the best search performance and behavior.
+`read` keeps model-facing payloads bounded by default: MCP reads return at most 64 KiB of text unless `max_bytes` explicitly requests more (up to the 512 KiB hard cap). For a single file, use 1-based `start_line`/`end_line`; budget-truncated ranged reads return `nextStartLine` so the next call can continue without re-reading the earlier chunk.
+
+`search_text` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Search results also have an independent response-byte budget: 64 KiB by default and 256 KiB maximum, in addition to match-count limits.
+
+To reduce ChatGPT Web iframe and transcript overhead, high-frequency tools use the host-native tool UI: instructions, command start/run/poll/cancel, read/search, write/edit, Git status/diff, and project/session memory. Rich CatDesk widgets remain for low-frequency flows where the visual UI is useful, such as verification, verified Git actions, delete confirmation, and optional Library handoff. The shared widget resource uses a deterministic revisioned URI with a one-hour private cache lifetime so reconnects and CatDesk restarts can reuse the same cached resource.
 
 # Context window
 
