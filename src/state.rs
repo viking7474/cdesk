@@ -728,6 +728,8 @@ pub struct AppState {
     pub last_tool_call_ms: Option<u128>,
     pub usage_by_model: BTreeMap<String, UsageTotals>,
     pub session_usage_totals: UsageTotals,
+    usage_persist_pending_calls: u64,
+    last_usage_persist_ms: u128,
     pub command_jobs: CommandJobManager,
     config_path: PathBuf,
     pub server_handle: Option<tokio::task::JoinHandle<()>>,
@@ -751,6 +753,8 @@ const FLOW_STEP_FIXED_MS: u64 =
 const FLOW_TURN_TRANSITION_MS: u64 = 24;
 const FLOW_CLOSE_PRUNE_MULTIPLIER: u64 = 3;
 const FLOW_BOOTSTRAP_STATUS_CLOSE_DELAY_MS: u128 = 3_000;
+const USAGE_PERSIST_CALL_INTERVAL: u64 = 10;
+const USAGE_PERSIST_TIME_INTERVAL_MS: u128 = 30_000;
 
 fn short_flow_id(flow_id: &str) -> String {
     flow_id[..flow_id.len().min(8)].to_string()
@@ -1116,6 +1120,8 @@ impl AppState {
             last_tool_call_ms: None,
             usage_by_model: config.usage_by_model,
             session_usage_totals: UsageTotals::default(),
+            usage_persist_pending_calls: 0,
+            last_usage_persist_ms: now_unix_millis(),
             command_jobs: CommandJobManager::new(),
             config_path,
             server_handle: None,
@@ -1190,13 +1196,16 @@ impl AppState {
         self.chatgpt_connector_refresh_required = false;
     }
 
-    pub fn persist_state(&self) -> std::io::Result<()> {
-        self.app_config()?.save_to_path(&self.config_path)
+    pub fn persist_state(&mut self) -> std::io::Result<()> {
+        self.app_config()?.save_to_path(&self.config_path)?;
+        self.usage_persist_pending_calls = 0;
+        self.last_usage_persist_ms = now_unix_millis();
+        Ok(())
     }
 
     pub fn persist_state_with_log(&mut self) {
-        if let Err(e) = self.persist_state() {
-            self.log("WARN", format!("Failed to persist app state: {e}"));
+        if let Err(error) = self.persist_state() {
+            self.log("WARN", format!("Failed to persist app state: {error}"));
         }
     }
 
@@ -1215,6 +1224,29 @@ impl AppState {
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
         self.session_usage_totals
             .accumulate(tool_input_tokens, tool_output_tokens, 1);
+        self.usage_persist_pending_calls = self.usage_persist_pending_calls.saturating_add(1);
+    }
+
+    pub(crate) fn persist_usage_if_due_with_log(&mut self) -> bool {
+        if self.usage_persist_pending_calls == 0 {
+            return false;
+        }
+
+        let now = now_unix_millis();
+        let due_by_calls = self.usage_persist_pending_calls >= USAGE_PERSIST_CALL_INTERVAL;
+        let due_by_time =
+            now.saturating_sub(self.last_usage_persist_ms) >= USAGE_PERSIST_TIME_INTERVAL_MS;
+        if !due_by_calls && !due_by_time {
+            return false;
+        }
+
+        match self.persist_state() {
+            Ok(()) => true,
+            Err(error) => {
+                self.log("WARN", format!("Failed to persist usage state: {error}"));
+                false
+            }
+        }
     }
 
     pub fn apply_server_ui_event(&mut self, event: ServerUiEvent) {
@@ -1815,6 +1847,73 @@ toolCallCount = 1
 
         let _ = std::fs::remove_file(config_path);
         let _ = std::fs::remove_dir(workspace);
+    }
+
+    #[test]
+    fn usage_persistence_batches_tool_calls_and_flushes_at_threshold() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("catdesk-config-usage-batch-{unique}"));
+        std::fs::create_dir_all(&workspace).expect("create temp workspace");
+        let config_path = workspace.join(APP_CONFIG_FILE_NAME);
+
+        let mut app = AppState::from_config_path(
+            8787,
+            workspace.to_string_lossy().into_owned(),
+            config_path.clone(),
+        )
+        .expect("create app state");
+
+        for _ in 0..(USAGE_PERSIST_CALL_INTERVAL - 1) {
+            app.record_turn_usage(1, 2);
+            assert!(!app.persist_usage_if_due_with_log());
+        }
+        assert!(
+            !config_path.exists(),
+            "usage batching should avoid a config write before the call threshold"
+        );
+
+        app.record_turn_usage(1, 2);
+        assert!(app.persist_usage_if_due_with_log());
+        assert!(config_path.exists());
+
+        let saved = AppConfig::load_from_path(&config_path).expect("load persisted usage");
+        let saved_usage = saved
+            .usage_by_model
+            .get(CURRENT_USAGE_BUCKET)
+            .expect("saved current usage bucket");
+        assert_eq!(
+            saved_usage.tool_call_count,
+            USAGE_PERSIST_CALL_INTERVAL
+        );
+        assert_eq!(
+            app.usage_persist_pending_calls,
+            0,
+            "successful flush must clear the pending-call counter"
+        );
+
+        app.record_turn_usage(3, 4);
+        app.last_usage_persist_ms =
+            now_unix_millis().saturating_sub(USAGE_PERSIST_TIME_INTERVAL_MS);
+        assert!(
+            app.persist_usage_if_due_with_log(),
+            "elapsed time should flush usage before the call-count threshold"
+        );
+
+        app.record_turn_usage(5, 6);
+        assert_eq!(app.usage_persist_pending_calls, 1);
+        app.persist_state_with_log();
+        assert_eq!(
+            app.usage_persist_pending_calls,
+            0,
+            "ordinary state persistence must also flush pending usage"
+        );
+
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[test]

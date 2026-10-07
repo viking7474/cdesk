@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, Serializer as _};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -100,6 +101,27 @@ impl JsonRpcResponse {
             result: None,
             error: Some(JsonRpcError { code, message }),
         }
+    }
+
+    pub fn into_value(self) -> Value {
+        let mut object = Map::new();
+        object.insert("jsonrpc".to_string(), Value::String(self.jsonrpc));
+        if let Some(id) = self.id {
+            object.insert("id".to_string(), id);
+        }
+        if let Some(result) = self.result {
+            object.insert("result".to_string(), result);
+        }
+        if let Some(error) = self.error {
+            object.insert(
+                "error".to_string(),
+                json!({
+                    "code": error.code,
+                    "message": error.message,
+                }),
+            );
+        }
+        Value::Object(object)
     }
 }
 
@@ -352,8 +374,7 @@ fn handle_resources_list_with_show_detail_mode(
 }
 
 fn current_widget_resource_uri() -> String {
-    let token_stats_layout = current_token_stats_layout();
-    let widget_corner_style = current_widget_corner_style();
+    let (token_stats_layout, widget_corner_style) = current_widget_preferences();
     format!(
         "{UI_TEMPLATE_URI}?widgetRevision={WIDGET_RESOURCE_REVISION}&tokenStatsLayout={}&widgetCornerStyle={}",
         token_stats_layout.as_str(),
@@ -363,6 +384,61 @@ fn current_widget_resource_uri() -> String {
 
 pub(crate) fn is_catdesk_widget_resource_uri(uri: &str) -> bool {
     uri == UI_TEMPLATE_URI || uri.starts_with(&format!("{UI_TEMPLATE_URI}?"))
+}
+
+fn widget_token_stats_layout_from_uri(resource_uri: &str) -> &'static str {
+    let requested = resource_uri
+        .split_once('?')
+        .map(|(_, query)| query)
+        .and_then(|query| {
+            query.split('&').find_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                (key == "tokenStatsLayout").then_some(value)
+            })
+        });
+    match requested {
+        Some("disable") => "disable",
+        Some("right") => "right",
+        Some("bottom") => "bottom",
+        _ => current_widget_preferences().0.as_str(),
+    }
+}
+
+fn widget_resource_uri_is_cacheable(resource_uri: &str) -> bool {
+    let Some((base, query)) = resource_uri.split_once('?') else {
+        return false;
+    };
+    if base != UI_TEMPLATE_URI {
+        return false;
+    }
+
+    let mut revision = None;
+    let mut token_stats_layout = None;
+    let mut widget_corner_style = None;
+    let mut entry_count = 0usize;
+    for entry in query.split('&') {
+        let Some((key, value)) = entry.split_once('=') else {
+            return false;
+        };
+        entry_count = entry_count.saturating_add(1);
+        match key {
+            "widgetRevision" if revision.is_none() => {
+                revision = value.parse::<u32>().ok();
+            }
+            "tokenStatsLayout" if token_stats_layout.is_none() => {
+                token_stats_layout = Some(value);
+            }
+            "widgetCornerStyle" if widget_corner_style.is_none() => {
+                widget_corner_style = Some(value);
+            }
+            _ => return false,
+        }
+    }
+
+    entry_count == 3
+        && revision == Some(WIDGET_RESOURCE_REVISION)
+        && matches!(token_stats_layout, Some("disable" | "right" | "bottom"))
+        && matches!(widget_corner_style, Some("rounded" | "square"))
 }
 
 fn render_widget_html_uncached(resource_uri: &str) -> String {
@@ -390,7 +466,7 @@ fn render_widget_html_uncached(resource_uri: &str) -> String {
         .replace(REMOVE_CATDESK_IMAGE_PLACEHOLDER, &remove_catdesk_image)
         .replace(
             INITIAL_TOKEN_STATS_LAYOUT_PLACEHOLDER,
-            current_token_stats_layout().as_str(),
+            widget_token_stats_layout_from_uri(resource_uri),
         )
         // Tool-specific loading text comes from the tool result metadata. Keeping
         // the template itself tool-agnostic lets every widget-bearing tool share
@@ -402,19 +478,20 @@ fn render_widget_html_uncached(resource_uri: &str) -> String {
 fn render_widget_html(resource_uri: &str, _mascot_seed: u64) -> String {
     static CACHE: OnceLock<StdMutex<HashMap<String, String>>> = OnceLock::new();
 
-    // Cache only canonical CatDesk resource keys. resources/read intentionally
-    // tolerates older revisioned URIs, but arbitrary query strings must not be
-    // able to grow a process-local cache without bound.
-    let cacheable = resource_uri == UI_TEMPLATE_URI || resource_uri == current_widget_resource_uri();
+    // Cache only well-formed resource keys for the current widget revision.
+    // The URI fully captures the layout/style state, and there are only six
+    // valid preference combinations. Bare, legacy, malformed, or extended
+    // query strings render uncached.
+    let cacheable = widget_resource_uri_is_cacheable(resource_uri);
     if !cacheable {
         return render_widget_html_uncached(resource_uri);
     }
 
     let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(html) = guard.get(resource_uri)
-    {
-        return html.clone();
+    if let Ok(guard) = cache.lock() {
+        if let Some(html) = guard.get(resource_uri) {
+            return html.clone();
+        }
     }
 
     let html = render_widget_html_uncached(resource_uri);
@@ -1421,9 +1498,17 @@ async fn handle_tools_list_with_show_detail_mode(
         }
     }
 
+    let shared_widget_resource_uri =
+        (show_detail_mode != ShowDetailMode::Disable).then(current_widget_resource_uri);
     for tool in &mut tools {
         ensure_local_tool_output_schema(tool);
-        ensure_tool_descriptor_widget_template_with_show_detail_mode(tool, show_detail_mode);
+        if let Some(resource_uri) = shared_widget_resource_uri.as_deref() {
+            ensure_tool_descriptor_widget_template_with_uri(
+                tool,
+                show_detail_mode,
+                resource_uri,
+            );
+        }
     }
 
     JsonRpcResponse::success(req.id.clone(), json!({ "tools": tools }))
@@ -3140,11 +3225,20 @@ fn handle_catdesk_instruction_with_show_detail_mode(
     response
 }
 
-fn build_turn_token_payload(req: &JsonRpcRequest, tool_name: &str) -> Value {
-    json!({
-        "name": tool_name,
-        "arguments": tool_arguments(req),
-    })
+#[derive(Serialize)]
+struct TurnTokenInputPayload<'a> {
+    arguments: &'a Value,
+    name: &'a str,
+}
+
+fn turn_token_input_payload<'a>(
+    req: &'a JsonRpcRequest,
+    tool_name: &'a str,
+) -> TurnTokenInputPayload<'a> {
+    TurnTokenInputPayload {
+        name: tool_name,
+        arguments: req.params.get("arguments").unwrap_or(&Value::Null),
+    }
 }
 
 fn estimate_tokens_o200k(text: &str) -> u64 {
@@ -3155,18 +3249,49 @@ fn estimate_tokens_o200k(text: &str) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn estimate_value_tokens_o200k(value: &Value) -> u64 {
+fn estimate_serializable_tokens_o200k<T>(value: &T) -> u64
+where
+    T: Serialize + ?Sized,
+{
     match serde_json::to_string(value) {
         Ok(serialized) => estimate_tokens_o200k(&serialized),
         Err(_) => 0,
     }
 }
 
+fn estimate_result_tokens_o200k(result: &Value) -> u64 {
+    let Some(object) = result.as_object() else {
+        return estimate_serializable_tokens_o200k(result);
+    };
+
+    let mut buffer = Vec::new();
+    let mut serializer = serde_json::Serializer::new(&mut buffer);
+    let hidden_meta_entries = if object.contains_key("_meta") { 1 } else { 0 };
+    let visible_len = object.len().saturating_sub(hidden_meta_entries);
+    let Ok(mut map) = (&mut serializer).serialize_map(Some(visible_len)) else {
+        return 0;
+    };
+    for (key, value) in object {
+        if key == "_meta" {
+            continue;
+        }
+        if map.serialize_entry(key, value).is_err() {
+            return 0;
+        }
+    }
+    if map.end().is_err() {
+        return 0;
+    }
+    let Ok(serialized) = std::str::from_utf8(&buffer) else {
+        return 0;
+    };
+    estimate_tokens_o200k(serialized)
+}
+
 fn estimate_turn_token_usage(req: &JsonRpcRequest, tool_name: &str, result: &Value) -> TokenUsage {
-    let tool_input_payload = build_turn_token_payload(req, tool_name);
-    let tool_input_tokens = estimate_value_tokens_o200k(&tool_input_payload);
-    let tool_output_payload = sanitize_result_for_turn_token_count(result);
-    let tool_output_tokens = estimate_value_tokens_o200k(&tool_output_payload);
+    let tool_input_payload = turn_token_input_payload(req, tool_name);
+    let tool_input_tokens = estimate_serializable_tokens_o200k(&tool_input_payload);
+    let tool_output_tokens = estimate_result_tokens_o200k(result);
     TokenUsage::from_counts(tool_input_tokens, tool_output_tokens)
 }
 
@@ -3174,15 +3299,6 @@ pub(crate) fn estimate_turn_token_counts(req: &JsonRpcRequest, result: &Value) -
     let tool_name = tool_name_from_request(req);
     let usage = estimate_turn_token_usage(req, &tool_name, result);
     (usage.tool_input_tokens, usage.tool_output_tokens)
-}
-
-fn sanitize_result_for_turn_token_count(result: &Value) -> Value {
-    let mut sanitized = result.clone();
-    let Some(obj) = sanitized.as_object_mut() else {
-        return sanitized;
-    };
-    obj.remove("_meta");
-    sanitized
 }
 
 fn ensure_output_template_meta(meta_value: &mut Value) {
@@ -3272,9 +3388,10 @@ fn tool_descriptor_should_attach_widget(name: &str) -> bool {
     )
 }
 
-fn ensure_tool_descriptor_widget_template_with_show_detail_mode(
+fn ensure_tool_descriptor_widget_template_with_uri(
     tool: &mut Value,
     show_detail_mode: ShowDetailMode,
+    resource_uri: &str,
 ) {
     if show_detail_mode == ShowDetailMode::Disable {
         return;
@@ -3286,15 +3403,24 @@ fn ensure_tool_descriptor_widget_template_with_show_detail_mode(
     let Some(name) = tool_obj.get("name").and_then(Value::as_str) else {
         return;
     };
-    let name = name.to_string();
-    if !tool_descriptor_should_attach_widget(&name) {
+    if !tool_descriptor_should_attach_widget(name) {
         return;
     }
-    let resource_uri = current_widget_resource_uri();
     let meta_value = tool_obj
         .entry("_meta".to_string())
         .or_insert_with(|| json!({}));
-    ensure_output_template_meta_with_uri(meta_value, &resource_uri);
+    ensure_output_template_meta_with_uri(meta_value, resource_uri);
+}
+
+fn ensure_tool_descriptor_widget_template_with_show_detail_mode(
+    tool: &mut Value,
+    show_detail_mode: ShowDetailMode,
+) {
+    if show_detail_mode == ShowDetailMode::Disable {
+        return;
+    }
+    let resource_uri = current_widget_resource_uri();
+    ensure_tool_descriptor_widget_template_with_uri(tool, show_detail_mode, &resource_uri);
 }
 
 fn extract_tool_result_text(result: &Value) -> String {
@@ -3430,7 +3556,7 @@ fn base_widget_payload(
     tool_name: Option<&str>,
 ) -> Map<String, Value> {
     let mut payload = Map::new();
-    let token_stats_layout = current_token_stats_layout();
+    let (token_stats_layout, widget_corner_style) = current_widget_preferences();
     payload.insert("schema".to_string(), json!("catdesk.review.v1"));
     payload.insert("panelMode".to_string(), json!(panel_mode));
     payload.insert("title".to_string(), json!(title));
@@ -3441,7 +3567,7 @@ fn base_widget_payload(
     );
     payload.insert(
         "widgetCornerStyle".to_string(),
-        json!(current_widget_corner_style().as_str()),
+        json!(widget_corner_style.as_str()),
     );
     if let Some(tool_name) = tool_name {
         payload.insert("toolName".to_string(), json!(tool_name));
@@ -3465,15 +3591,9 @@ fn base_widget_payload_with_show_detail_mode(
     payload
 }
 
-fn current_token_stats_layout() -> TokenStatsLayout {
+fn current_widget_preferences() -> (TokenStatsLayout, WidgetCornerStyle) {
     load_app_config()
-        .map(|config| config.token_stats_layout)
-        .unwrap_or_default()
-}
-
-fn current_widget_corner_style() -> WidgetCornerStyle {
-    load_app_config()
-        .map(|config| config.widget_corner_style)
+        .map(|config| (config.token_stats_layout, config.widget_corner_style))
         .unwrap_or_default()
 }
 
@@ -5182,6 +5302,29 @@ fn handle_delete_path(req: &JsonRpcRequest, workspace_root: &str) -> JsonRpcResp
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn jsonrpc_response_into_value_matches_serde_wire_shape() {
+        let success = JsonRpcResponse::success(
+            Some(json!("req-1")),
+            json!({
+                "structuredContent": {
+                    "toolName": "read",
+                    "text": "hello"
+                }
+            }),
+        );
+        let expected_success = serde_json::to_value(&success).expect("serialize success response");
+        assert_eq!(success.into_value(), expected_success);
+
+        let error = JsonRpcResponse::error(
+            Some(json!(7)),
+            -32601,
+            "Method not found".to_string(),
+        );
+        let expected_error = serde_json::to_value(&error).expect("serialize error response");
+        assert_eq!(error.into_value(), expected_error);
+    }
 
     fn resources_list_request() -> JsonRpcRequest {
         JsonRpcRequest {
@@ -8908,6 +9051,7 @@ mod tests {
     #[test]
     fn widget_html_render_is_deterministic_and_legacy_uris_still_render() {
         let canonical_uri = current_widget_resource_uri();
+        assert!(widget_resource_uri_is_cacheable(&canonical_uri));
         let first = render_widget_html(&canonical_uri, 1);
         let second = render_widget_html(&canonical_uri, 999);
         assert_eq!(first, second, "canonical widget HTML must be cache-stable");
@@ -8916,6 +9060,11 @@ mod tests {
         let legacy_uri = format!(
             "{UI_TEMPLATE_URI}?widgetRevision=7&tokenStatsLayout=bottom&widgetCornerStyle=rounded"
         );
+        assert!(!widget_resource_uri_is_cacheable(&legacy_uri));
+        assert!(!widget_resource_uri_is_cacheable(UI_TEMPLATE_URI));
+        assert!(!widget_resource_uri_is_cacheable(&format!(
+            "{canonical_uri}&unexpected=true"
+        )));
         let legacy = render_widget_html(&legacy_uri, 123);
         assert!(legacy.contains(&legacy_uri));
     }
@@ -9042,6 +9191,47 @@ mod tests {
                 .map(|domains| domains.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn token_estimator_matches_legacy_model_visible_payload_without_cloning_meta() {
+        let req = tool_call_request(
+            "read",
+            json!({
+                "paths": ["src/mcp.rs"],
+                "max_bytes": 65536
+            }),
+        );
+        let result = json!({
+            "content": [],
+            "structuredContent": {
+                "toolName": "read",
+                "path": "src/mcp.rs",
+                "text": "visible content"
+            },
+            "_meta": {
+                WIDGET_PAYLOAD_META_KEY: {
+                    "largeHiddenPayload": "x".repeat(256 * 1024)
+                }
+            }
+        });
+
+        let legacy_input = json!({
+            "name": "read",
+            "arguments": req.params.get("arguments").cloned().unwrap_or(Value::Null),
+        });
+        let mut legacy_output = result.clone();
+        legacy_output
+            .as_object_mut()
+            .expect("result object")
+            .remove("_meta");
+
+        let expected_input = estimate_serializable_tokens_o200k(&legacy_input);
+        let expected_output = estimate_serializable_tokens_o200k(&legacy_output);
+        let usage = estimate_turn_token_usage(&req, "read", &result);
+
+        assert_eq!(usage.tool_input_tokens, expected_input);
+        assert_eq!(usage.tool_output_tokens, expected_output);
     }
 
     #[test]

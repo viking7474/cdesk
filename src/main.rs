@@ -1793,6 +1793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.ngrok_url = None;
         app.remote_connected = false;
         app.last_remote_activity_ms = None;
+        app.persist_state_with_log();
     }
 
     result

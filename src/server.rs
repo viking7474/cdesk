@@ -3144,7 +3144,7 @@ async fn post_mcp_inner(
                         tool_input_tokens,
                         tool_output_tokens,
                     });
-                    app.persist_state_with_log();
+                    app.persist_usage_if_due_with_log();
                 }
                 app.all_time_usage_totals()
             };
@@ -3160,7 +3160,7 @@ async fn post_mcp_inner(
         if let Some(result) = resp.result.as_mut() {
             mcp::decorate_modern_result(&req.method, result);
         }
-        response_json = Some(serde_json::to_value(resp).unwrap());
+        response_json = Some(resp.into_value());
     }
 
     if req.id.is_some() {
