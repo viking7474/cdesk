@@ -238,7 +238,9 @@ If browser mode is enabled, CatDesk can also expose extra browser/devtools tools
 
 `search_text` uses `rg` when it is available, falls back to `grep`, then falls back to CatDesk's built-in scanner. Search results also have an independent response-byte budget: 64 KiB by default and 256 KiB maximum, in addition to match-count limits.
 
-To reduce ChatGPT Web iframe and transcript overhead, high-frequency tools use the host-native tool UI: instructions, command start/run/poll/cancel, read/search, write/edit, Git status/diff, and project/session memory. Rich CatDesk widgets remain for low-frequency flows where the visual UI is useful, such as verification, verified Git actions, delete confirmation, and optional Library handoff. The shared widget resource uses a deterministic revisioned URI with a one-hour private cache lifetime so reconnects and CatDesk restarts can reuse the same cached resource.
+To reduce ChatGPT Web iframe and transcript overhead, high-frequency tools use the host-native tool UI: instructions, command start/run/poll/cancel, read/search, write/edit, Git status/diff, and project/session memory. Rich CatDesk widgets remain for low-frequency flows where the visual UI is useful, such as verification, verified Git actions, delete confirmation, and optional Library handoff. The shared widget resource uses a deterministic revisioned URI with a one-hour private cache lifetime so reconnects and CatDesk restarts can reuse the same cached resource. CatDesk also keeps rendered current-revision widget HTML in a small bounded process cache, so repeated `resources/read` calls do not repeat image encoding and template expansion.
+
+Usage counters update in memory immediately but are persisted in batches (after 10 tool calls or 30 seconds, whichever comes first) instead of rewriting `config.toml` after every tool call. Any ordinary state save and normal CatDesk shutdown also flush pending usage.
 
 # Context window
 
